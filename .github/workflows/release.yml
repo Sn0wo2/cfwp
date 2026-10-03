@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (ignored for snapshots)
+        required: true
+        type: string
+      snapshot:
+        description: Build a snapshot without changing versions or publishing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    uses: ./.github/workflows/verify.yml
+    secrets: inherit
+  release:
+    name: Package release
+    needs: verify
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workspace/cfwp
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: workspace/cfwp
+          fetch-depth: 0
+      - uses: ./workspace/cfwp/.github/actions/setup-worker
+      - name: Install version tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+      - name: Normalize version
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+        run: echo "VERSION=${RELEASE_VERSION#v}" >> "$GITHUB_ENV"
+      - name: Bump workspace version
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH"
+          if git rev-parse --verify --quiet "refs/tags/v$VERSION"; then
+            echo "Tag v$VERSION already exists" >&2
+            exit 1
+          fi
+          cargo set-version --workspace "$VERSION"
+      - name: Validate workspace version
+        id: version
+        env:
+          SNAPSHOT: ${{ inputs.snapshot || false }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const { execFileSync } = require('node:child_process');
+          const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], { encoding: 'utf8' }));
+          const versions = new Set(metadata.packages.filter(pkg => metadata.workspace_members.includes(pkg.id)).map(pkg => pkg.version));
+          if (versions.size !== 1) throw new Error('All workspace packages must share one version');
+          const [version] = versions;
+          if (process.env.SNAPSHOT !== 'true' && process.env.VERSION !== version) throw new Error('Release version must match the workspace version');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          NODE
+      - name: Prepare Wrangler configuration
+        run: |
+          cp wrangler.example.toml wrangler.toml
+          sed -i 's|node scripts/build.js dev|node scripts/build.js release|' wrangler.toml
+      - name: Build combined Worker package
+        run: wrangler deploy --dry-run --config wrangler.toml
+        env:
+          CFWP_FEATURES: dns,proxy
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          install-only: true
+      - name: Commit and tag workspace version
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
+          git diff --cached --quiet || git commit -m "chore(release): bump version to $VERSION"
+          git tag "v$VERSION"
+          git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$VERSION"
+      - name: Publish tagged release
+        if: "!inputs.snapshot"
+        run: make release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: v${{ steps.version.outputs.version }}
+      - name: Build release snapshot
+        if: inputs.snapshot
+        run: make release-snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: v${{ steps.version.outputs.version }}
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.snapshot && 'snapshot-artifacts' || 'release-artifacts' }}
+          path: workspace/cfwp/dist/*
+          if-no-files-found: error
+          retention-days: ${{ inputs.snapshot && 7 || 30 }}

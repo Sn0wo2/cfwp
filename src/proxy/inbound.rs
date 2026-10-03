@@ -1,260 +1,523 @@
+use std::cell::Cell;
+use std::net::IpAddr;
+use std::rc::Rc;
+
+use base64::Engine;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWriteExt};
-use worker::{Context, Env, Request, Response, Result, Socket, WebSocket, WebSocketPair, WebsocketEvent};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
+use worker::{
+    Context, Env, Request, Response, Result, Socket, WebSocket, WebSocketPair, WebsocketEvent,
+};
 
-use crate::trace_error;
+use super::outbound::ProxyPlan;
+use super::protocol::{Codec, InitialRequest};
+use super::util::{CONNECT_TIMEOUT_MS, connect_tcp, with_timeout};
 
-use super::outbound::connect_tcp;
-use super::types::{DnsResolver, InitialRequest, ProxyConfig, ProxyPlan};
-use super::util::{decode_early_data, is_speedtest_host};
-
-pub struct ProxyService {
-    config: ProxyConfig,
-}
-
-pub struct InboundSession {
-    websocket: WebSocket,
-    user_id: String,
-    plan: ProxyPlan,
-    dns_resolver: DnsResolver,
-    early_data: String,
-}
-
-impl ProxyService {
-    pub fn new(env: Env) -> Result<Self> {
-        Ok(Self {
-            config: ProxyConfig::from_env(env)?,
-        })
+#[allow(clippy::single_call_fn)]
+pub(crate) async fn handle(
+    env: &Env,
+    config: &crate::config::Config,
+    req: Request,
+    ctx: Context,
+) -> Result<Response> {
+    let request_url = req.url()?;
+    let user_id = config.user_id.clone();
+    if request_url.path().strip_prefix('/') != Some(user_id.as_str())
+        && request_url.path().strip_prefix('/') != Some(user_id.replace('-', "").as_str())
+    {
+        acta::error!("fetch: websocket path mismatch");
+        return Response::error("Not Found", 404);
     }
 
-    pub fn is_websocket_request(req: &Request) -> bool {
-        req.headers()
-            .get("Upgrade")
-            .ok()
-            .flatten()
-            .map(|value| value.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false)
-    }
+    let mut plan = ProxyPlan {
+        entries: ProxyPlan::collect_entries(
+            env.var("PROXYIP").ok().map(|value| value.to_string()),
+            env.var("PROXY").ok().map(|value| value.to_string()),
+            false,
+        )?,
+    };
+    plan.entries.extend(ProxyPlan::collect_entries(
+        request_url
+            .query_pairs()
+            .find(|(key, _)| key.eq_ignore_ascii_case("proxyip"))
+            .map(|(_, value)| value.into_owned()),
+        request_url
+            .query_pairs()
+            .find(|(key, _)| key.eq_ignore_ascii_case("proxy"))
+            .map(|(_, value)| value.into_owned()),
+        true,
+    )?);
+    let early_data = req
+        .headers()
+        .get("sec-websocket-protocol")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    #[cfg(feature = "dns")]
+    let client_ip = req
+        .headers()
+        .get("CF-Connecting-IP")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    #[cfg(feature = "dns")]
+    let dns = Some(Rc::new(config.dns.clone()));
 
-    pub async fn handle(&self, req: Request, ctx: Context) -> Result<Response> {
-        let request_path = req.url()?.path().to_string();
-        if request_path != self.config.ws_path {
-            return Response::error("Not Found", 404);
-        }
+    let pair = WebSocketPair::new()?;
+    pair.server
+        .as_ref()
+        .set_binary_type(web_sys::BinaryType::Arraybuffer);
+    pair.server.accept()?;
+    let websocket = pair.server;
 
-        let pair = WebSocketPair::new()?;
-        pair.server
-            .as_ref()
-            .set_binary_type(web_sys::BinaryType::Arraybuffer);
-        pair.server.accept()?;
-
-        let session = InboundSession::new(
-            pair.server,
-            self.config.user_id.clone(),
-            self.config.plan_for(&req)?,
-            self.config.dns_resolver.clone(),
-            self.config.early_data_header(&req),
-        );
-
-        ctx.wait_until(async move {
-            if let Err(_err) = session.run().await {
-                trace_error!("channel task failed: {:?}", _err);
+    ctx.wait_until(async move {
+        acta::info!("session: websocket accepted");
+        let cleanup_websocket = websocket.clone();
+        if let Err(err) = async move {
+            let mut events = websocket.events()?;
+            let mut initial = if early_data.is_empty() {
+                Vec::new()
+            } else {
+                URL_SAFE_NO_PAD
+                    .decode(early_data.as_bytes())
+                    .or_else(|_| URL_SAFE.decode(early_data.as_bytes()))
+                    .unwrap_or_else(|err| {
+                        acta::error!("session: ignoring invalid early data: {err}");
+                        Vec::new()
+                    })
+            };
+            if !initial.is_empty() {
+                acta::info!("session: early data received ({} bytes)", initial.len());
             }
-        });
-
-        Response::from_websocket(pair.client)
-    }
-}
-
-impl InboundSession {
-    pub fn new(
-        websocket: WebSocket,
-        user_id: String,
-        plan: ProxyPlan,
-        dns_resolver: DnsResolver,
-        early_data: String,
-    ) -> Self {
-        Self {
-            websocket,
-            user_id,
-            plan,
-            dns_resolver,
-            early_data,
-        }
-    }
-
-    pub async fn run(self) -> Result<()> {
-        let mut events = self.websocket.events()?;
-        let payload = self.read_initial_payload(&mut events).await?;
-        if payload.is_empty() {
-            self.websocket.close(None, None::<String>)?;
-            return Ok(());
-        }
-
-        let request = match InitialRequest::parse(&payload, &self.user_id) {
-            Ok(request) => request,
-            Err(err) => {
-                let _ = self.websocket.close(Some(1008), Some("invalid request"));
-                return Err(err);
-            }
-        };
-
-        if is_speedtest_host(&request.hostname) {
-            self.websocket.close(Some(1008), Some("blocked"))?;
-            return Ok(());
-        }
-
-        if request.is_udp_only() {
-            self.websocket.close(Some(1003), Some("udp unsupported"))?;
-            return Ok(());
-        }
-
-        if request.is_dns_request() {
-            return self.forward_dns(&request).await;
-        }
-
-        self.forward_stream(events, request).await
-    }
-
-    async fn forward_dns(&self, request: &InitialRequest) -> Result<()> {
-        let response = self.dns_resolver.exchange(&request.payload).await?;
-        let mut packet = request.response_header.clone().unwrap_or_default();
-        packet.extend_from_slice(&response);
-        self.websocket.send_with_bytes(packet)?;
-        self.close()
-    }
-
-    async fn forward_stream(
-        &self,
-        mut events: worker::EventStream<'_>,
-        request: InitialRequest,
-    ) -> Result<()> {
-        match self.connect_primary(&request).await {
-            Ok(mut socket) => {
-                let has_data = self.pipe_streams(&mut events, &mut socket, request.response_header.clone()).await?;
-                if has_data || !self.plan.has_entries() {
-                    return self.close();
+            while initial.is_empty() {
+                match events.next().await {
+                    Some(event) => match event? {
+                        WebsocketEvent::Message(message) => {
+                            if let Some(payload) = decode_message(message) {
+                                acta::info!(
+                                    "session: first websocket message ({} bytes)",
+                                    payload.len()
+                                );
+                                initial = payload;
+                            }
+                        }
+                        WebsocketEvent::Close(_) => {
+                            acta::info!("session: websocket closed before first message");
+                            break;
+                        }
+                    },
+                    None => break,
                 }
-
-                let mut fallback = self.plan.connect_target(&request).await?;
-                let _ = self.pipe_streams(&mut events, &mut fallback, request.response_header.clone()).await?;
-                self.close()
             }
-            Err(err) => {
-                if !self.plan.has_entries() {
-                    let _ = self.websocket.close(Some(1011), Some("connect failed"));
+            if initial.is_empty() {
+                acta::info!("session: closed without an initial payload");
+                websocket.close(None, None::<String>)?;
+                return Ok(());
+            }
+
+            const MAX_INITIAL_HEADER: usize = 64 * 1024;
+            acta::info!("session: parsing initial payload ({} bytes)", initial.len());
+            let mut trailing = if initial.len() > MAX_INITIAL_HEADER {
+                initial.split_off(MAX_INITIAL_HEADER)
+            } else {
+                Vec::new()
+            };
+            let mut request = match loop {
+                match InitialRequest::parse(&initial, &user_id).await {
+                    Ok(Some(mut request)) => {
+                        if !trailing.is_empty() {
+                            let decoded = request.codec.inbound.decode(&trailing).await?;
+                            request.payload.extend(decoded);
+                        }
+                        break Ok(request);
+                    }
+                    Ok(None) if initial.len() < MAX_INITIAL_HEADER => match events.next().await {
+                        Some(Ok(WebsocketEvent::Message(message))) => {
+                            if let Some(bytes) = decode_message(message) {
+                                acta::info!("session: continued header ({} bytes)", bytes.len());
+                                let remaining = MAX_INITIAL_HEADER - initial.len();
+                                if bytes.len() > remaining {
+                                    let header = bytes.get(..remaining).ok_or_else(|| {
+                                        worker::Error::RustError(
+                                            "invalid initial request boundary".into(),
+                                        )
+                                    })?;
+                                    let payload = bytes.get(remaining..).ok_or_else(|| {
+                                        worker::Error::RustError(
+                                            "invalid initial request boundary".into(),
+                                        )
+                                    })?;
+                                    initial.extend_from_slice(header);
+                                    trailing.extend_from_slice(payload);
+                                } else {
+                                    initial.extend(bytes);
+                                }
+                            }
+                        }
+                        _ => {
+                            break Err(worker::Error::RustError("incomplete request".into()));
+                        }
+                    },
+                    Ok(None) => {
+                        break Err(worker::Error::RustError("request too large".into()));
+                    }
+                    Err(err) => break Err(err),
+                }
+            } {
+                Ok(request) => request,
+                Err(err) => {
+                    acta::error!("session: request parse failed: {err:?}");
+                    drop(websocket.close(Some(1008), Some("invalid request")));
                     return Err(err);
                 }
+            };
+            acta::info!("session: request parsed (port={})", request.port);
 
-                let mut fallback = self.plan.connect_target(&request).await?;
-                let _ = self.pipe_streams(&mut events, &mut fallback, request.response_header.clone()).await?;
-                self.close()
+            let hostname = request.hostname.as_str();
+            if request.port == 0
+                || (hostname.parse::<IpAddr>().is_err()
+                    && !(hostname.is_ascii()
+                        && hostname.len() <= 254
+                        && hostname
+                            .strip_suffix('.')
+                            .unwrap_or(hostname)
+                            .split('.')
+                            .all(|label| {
+                                !label.is_empty()
+                                    && label.len() <= 63
+                                    && label
+                                        .as_bytes()
+                                        .first()
+                                        .is_some_and(u8::is_ascii_alphanumeric)
+                                    && label
+                                        .as_bytes()
+                                        .last()
+                                        .is_some_and(u8::is_ascii_alphanumeric)
+                                    && label
+                                        .bytes()
+                                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                            })))
+            {
+                acta::error!("session: invalid target authority");
+                drop(websocket.close(Some(1008), Some("invalid request")));
+                return Err(worker::Error::RustError("invalid target authority".into()));
             }
-        }
-    }
 
-    async fn connect_primary(&self, request: &InitialRequest) -> Result<Socket> {
-        let mut socket = connect_tcp(&request.hostname, request.port)?;
-        socket.opened().await?;
-        if !request.payload.is_empty() {
-            socket.write_all(&request.payload).await?;
-            socket.flush().await?;
-        }
-        Ok(socket)
-    }
+            if request.hostname == "speed.cloudflare.com"
+                || request.hostname.ends_with(".speed.cloudflare.com")
+            {
+                websocket.close(Some(1008), Some("blocked"))?;
+                return Ok(());
+            }
 
-    async fn read_initial_payload(&self, events: &mut worker::EventStream<'_>) -> Result<Vec<u8>> {
-        let early = decode_early_data(&self.early_data)?;
-        if !early.is_empty() {
-            return Ok(early);
-        }
+            #[cfg(feature = "dns")]
+            let udp_only = request.is_udp && !request.is_dns_request();
+            #[cfg(not(feature = "dns"))]
+            let udp_only = request.is_udp;
+            if udp_only {
+                acta::info!("session: UDP request unsupported");
+                websocket.close(Some(1003), Some("udp unsupported"))?;
+                return Ok(());
+            }
 
-        while let Some(event) = events.next().await {
-            match event? {
-                WebsocketEvent::Message(message) => {
-                    if let Some(payload) = Self::decode_message(message) {
-                        return Ok(payload);
+            #[cfg(feature = "dns")]
+            if request.is_dns_request() {
+                acta::info!("session: forwarding DNS request");
+                let mut pending = std::mem::take(&mut request.payload);
+                loop {
+                    while pending.len() >= 2 {
+                        let length_bytes = pending
+                            .get(..2)
+                            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+                            .ok_or_else(|| {
+                                worker::Error::RustError("invalid DNS packet frame".into())
+                            })?;
+                        let length = usize::from(u16::from_be_bytes(length_bytes));
+                        if length == 0 {
+                            return Err(worker::Error::RustError(
+                                "invalid DNS packet frame".into(),
+                            ));
+                        }
+                        let frame_end = length.checked_add(2).ok_or_else(|| {
+                            worker::Error::RustError("invalid DNS packet frame".into())
+                        })?;
+                        if pending.len() < frame_end {
+                            break;
+                        }
+
+                        let query = pending.get(2..frame_end).ok_or_else(|| {
+                            worker::Error::RustError("invalid DNS packet frame".into())
+                        })?;
+                        let response = match dns.as_ref() {
+                            Some(dns) => {
+                                dns.exchange_prepared(dns.prepare(query, client_ip)?)
+                                    .await?
+                            }
+                            None => return Ok(()),
+                        };
+                        let response_length = u16::try_from(response.len()).map_err(|_| {
+                            worker::Error::RustError("DNS response too large".into())
+                        })?;
+                        let mut framed = Vec::with_capacity(response.len() + 2);
+                        framed.extend_from_slice(&response_length.to_be_bytes());
+                        framed.extend_from_slice(&response);
+                        websocket.send_with_bytes(request.codec.outbound.encode(&framed).await?)?;
+                        pending.drain(..length + 2);
+                    }
+
+                    match events.next().await {
+                        Some(Ok(WebsocketEvent::Message(message))) => {
+                            if let Some(bytes) = decode_message(message) {
+                                pending.extend(request.codec.inbound.decode(&bytes).await?);
+                            }
+                        }
+                        Some(Ok(WebsocketEvent::Close(_))) | None => {
+                            if pending.is_empty() {
+                                websocket.close(None, None::<String>)?;
+                                return Ok(());
+                            }
+                            return Err(worker::Error::RustError("incomplete DNS packet".into()));
+                        }
+                        Some(Err(err)) => return Err(err),
                     }
                 }
-                WebsocketEvent::Close(_) => return Ok(Vec::new()),
             }
-        }
 
-        Ok(Vec::new())
-    }
+            if let Some(mode) = request.mux_mode() {
+                acta::info!("session: mux session accepted ({mode:?})");
+                let InitialRequest { payload, codec, .. } = request;
+                return super::mux::handle(&websocket, events, codec, payload, mode).await;
+            }
 
-    async fn pipe_streams(
-        &self,
-        events: &mut worker::EventStream<'_>,
-        socket: &mut Socket,
-        response_header: Option<Vec<u8>>,
-    ) -> Result<bool> {
-        let (mut reader_socket, mut writer_socket) = split(socket);
-        let websocket = self.websocket.clone();
-        let reader = async move { Self::pipe_remote_to_ws(&websocket, &mut reader_socket, response_header).await };
-        let writer = async move {
-            while let Some(event) = events.next().await {
-                match event? {
-                    WebsocketEvent::Message(message) => {
-                        if let Some(payload) = Self::decode_message(message) {
-                            writer_socket.write_all(&payload).await?;
-                            writer_socket.flush().await?;
+            acta::info!("session: connecting primary target (port={})", request.port);
+            #[cfg(feature = "dns")]
+            let hostname = match dns.as_deref() {
+                Some(dns) => {
+                    use domain::base::{Message, MessageBuilder, Name, Rtype};
+                    use domain::rdata::AllRecordData;
+
+                    let resolved: Result<Option<IpAddr>> = async {
+                        if request.hostname.parse::<IpAddr>().is_ok() {
+                            return Ok(None);
+                        }
+                        let Ok(name) = Name::vec_from_str(&request.hostname) else {
+                            return Ok(None);
+                        };
+                        let mut id = [0_u8; 2];
+                        getrandom::fill(&mut id)
+                            .map_err(|_| worker::Error::RustError("rng failed".into()))?;
+                        let mut builder = MessageBuilder::new_vec();
+                        builder.header_mut().set_id(u16::from_be_bytes(id));
+                        builder.header_mut().set_rd(true);
+                        let mut question = builder.question();
+                        question.push((name, Rtype::A)).map_err(|_| {
+                            worker::Error::RustError("invalid DNS query name".into())
+                        })?;
+                        let query = question.into_message().into_octets();
+
+                        let response = dns.exchange(&query, None).await.map_err(|err| {
+                            worker::Error::RustError(format!("DNS resolution failed: {err}"))
+                        })?;
+                        let Ok(message) = Message::from_octets(&response) else {
+                            return Ok(None);
+                        };
+                        if message.header().rcode() != domain::base::iana::Rcode::NOERROR {
+                            return Ok(None);
+                        }
+                        let Ok(answer) = message.answer() else {
+                            return Ok(None);
+                        };
+                        for parsed in answer.flatten() {
+                            if parsed.rtype() != Rtype::A && parsed.rtype() != Rtype::AAAA {
+                                continue;
+                            }
+                            let Ok(Some(record)) = parsed.into_record::<
+                                AllRecordData<
+                                    &[u8],
+                                    domain::base::name::ParsedName<&[u8]>,
+                                >,
+                            >() else {
+                                continue;
+                            };
+                            return Ok(match record.data() {
+                                AllRecordData::A(a) => Some(IpAddr::V4(a.addr())),
+                                AllRecordData::Aaaa(a) => Some(IpAddr::V6(a.addr())),
+                                _ => None,
+                            });
+                        }
+                        Ok(None)
+                    }
+                    .await;
+                    match resolved {
+                        Ok(Some(ip)) => ip.to_string(),
+                        Ok(None) => request.hostname.clone(),
+                        Err(err) => {
+                            acta::warn!("session: DNS resolution failed, using hostname: {err}");
+                            request.hostname.clone()
                         }
                     }
-                    WebsocketEvent::Close(_) => break,
+                }
+                None => request.hostname.clone(),
+            };
+            #[cfg(not(feature = "dns"))]
+            let hostname = request.hostname.clone();
+            match match connect_tcp(&hostname, request.port) {
+                Err(err) => Err(err),
+                Ok(mut socket) => match with_timeout(CONNECT_TIMEOUT_MS, async {
+                    socket.opened().await?;
+                    if !request.payload.is_empty() {
+                        socket.write_all(&request.payload).await?;
+                        socket.flush().await?;
+                    }
+                    Ok(())
+                })
+                .await
+                {
+                    Some(Ok(())) => Ok(socket),
+                    Some(Err(err)) => {
+                        drop(socket.close().await);
+                        Err(err)
+                    }
+                    None => {
+                        drop(socket.close().await);
+                        Err(worker::Error::RustError(format!(
+                            "target connection timed out after {CONNECT_TIMEOUT_MS} ms"
+                        )))
+                    }
+                },
+            } {
+                Ok(mut socket) => {
+                    acta::info!("session: primary connection opened");
+                    let (has_data, has_client_data) = match pipe_streams(
+                        &websocket,
+                        &mut events,
+                        &mut socket,
+                        &mut request.codec,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            drop(socket.close().await);
+                            return Err(err);
+                        }
+                    };
+                    drop(socket.close().await);
+                    acta::info!("session: primary stream ended (remote_data={has_data})");
+                    if has_data || has_client_data || !plan.has_entries() {
+                        websocket.close(None, None::<String>)?;
+                        return Ok(());
+                    }
+                    acta::info!("session: trying alternate route after empty response");
+                    let mut fallback = plan.connect_via_entries(&request).await?;
+                    if let Err(err) =
+                        pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
+                            .await
+                    {
+                        drop(fallback.close().await);
+                        return Err(err);
+                    }
+                    drop(fallback.close().await);
+                    websocket.close(None, None::<String>)?;
+                    Ok(())
+                }
+                Err(err) => {
+                    acta::error!("session: primary connection failed: {err:?}");
+                    if !plan.has_entries() {
+                        return Err(err);
+                    }
+                    acta::info!("session: trying alternate route");
+                    let mut fallback = plan.connect_via_entries(&request).await?;
+                    if let Err(err) =
+                        pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
+                            .await
+                    {
+                        drop(fallback.close().await);
+                        return Err(err);
+                    }
+                    drop(fallback.close().await);
+                    websocket.close(None, None::<String>)?;
+                    Ok(())
                 }
             }
-
-            writer_socket.shutdown().await?;
-            Ok::<(), worker::Error>(())
-        };
-
-        match futures_util::future::select(Box::pin(reader), Box::pin(writer)).await {
-            futures_util::future::Either::Left((result, _)) => result,
-            futures_util::future::Either::Right((result, _)) => {
-                result?;
-                Ok(true)
-            }
         }
-    }
+        .await
+        {
+            acta::error!("channel task failed: {err:?}");
+            drop(cleanup_websocket.close(Some(1011), Some("internal error")));
+        }
+    });
 
-    async fn pipe_remote_to_ws(
-        websocket: &WebSocket,
-        socket: &mut (impl AsyncRead + Unpin),
-        mut response_header: Option<Vec<u8>>,
-    ) -> Result<bool> {
+    Response::from_websocket(pair.client)
+}
+
+async fn pipe_streams(
+    websocket: &WebSocket,
+    events: &mut worker::EventStream<'_>,
+    socket: &mut Socket,
+    codec: &mut Codec,
+) -> Result<(bool, bool)> {
+    let (mut reader_socket, mut writer_socket) = split(socket);
+    let (decoder, encoder) = (&mut codec.inbound, &mut codec.outbound);
+    let websocket = websocket.clone();
+    let client_data = Rc::new(Cell::new(false));
+    let client_data_writer = client_data.clone();
+    let reader = async move {
         let mut buf = vec![0_u8; 16 * 1024];
         let mut has_data = false;
-
         loop {
-            let read = socket.read(&mut buf).await?;
+            let read = reader_socket.read(&mut buf).await?;
             if read == 0 {
                 break;
             }
-
             has_data = true;
-            if let Some(header) = response_header.take() {
-                let mut merged = Vec::with_capacity(header.len() + read);
-                merged.extend_from_slice(&header);
-                merged.extend_from_slice(&buf[..read]);
-                websocket.send_with_bytes(merged)?;
-            } else {
-                websocket.send_with_bytes(&buf[..read])?;
+            let bytes = buf
+                .get(..read)
+                .ok_or_else(|| worker::Error::RustError("invalid socket read length".into()))?;
+            websocket.send_with_bytes(encoder.encode(bytes).await?)?;
+        }
+        Ok::<bool, worker::Error>(has_data)
+    };
+    let writer = async move {
+        while let Some(event) = events.next().await {
+            match event? {
+                WebsocketEvent::Message(message) => {
+                    if let Some(payload) = decode_message(message) {
+                        let decoded = decoder.decode(&payload).await?;
+                        if !decoded.is_empty() {
+                            client_data_writer.set(true);
+                            writer_socket.write_all(&decoded).await?;
+                            writer_socket.flush().await?;
+                        }
+                    }
+                }
+                WebsocketEvent::Close(_) => break,
             }
         }
 
-        Ok(has_data)
-    }
+        writer_socket.shutdown().await?;
+        Ok::<(), worker::Error>(())
+    };
 
-    fn decode_message(message: worker::MessageEvent) -> Option<Vec<u8>> {
-        message
-            .bytes()
-            .filter(|bytes| !bytes.is_empty())
-            .or_else(|| message.text().and_then(|text| (!text.is_empty()).then_some(text.into_bytes())))
+    match futures_util::future::select(Box::pin(reader), Box::pin(writer)).await {
+        futures_util::future::Either::Left((result, _)) => {
+            result.map(|has_data| (has_data, client_data.get()))
+        }
+        futures_util::future::Either::Right((result, _)) => {
+            result?;
+            Ok((true, client_data.get()))
+        }
     }
+}
 
-    fn close(&self) -> Result<()> {
-        let _ = self.websocket.close(None, None::<String>);
-        Ok(())
-    }
+fn decode_message(message: worker::MessageEvent) -> Option<Vec<u8>> {
+    message
+        .bytes()
+        .filter(|bytes| !bytes.is_empty())
+        .or_else(|| {
+            message
+                .text()
+                .and_then(|text| (!text.is_empty()).then_some(text.into_bytes()))
+        })
 }

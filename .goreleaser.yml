@@ -1,0 +1,40 @@
+version: 2
+
+project_name: cfwp
+
+builds:
+  - id: worker
+    skip: true
+
+source:
+  enabled: false
+
+archives:
+  - id: worker
+    meta: true
+    name_template: "{{ .ProjectName }}_{{ .Version }}"
+    formats:
+      - tar.gz
+    files:
+      - build/index.js
+      - build/package.json
+      - build/worker/*.mjs
+      - build/worker/*.wasm
+      - LICENSE
+      - src: build/wrangler.toml
+        dst: .
+        strip_parent: true
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+
+release:
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"

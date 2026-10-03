@@ -1,0 +1,12 @@
+[package]
+name = "socksaddr"
+description = "SOCKS and Xray address encoding and decoding"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

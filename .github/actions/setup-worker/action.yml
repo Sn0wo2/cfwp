@@ -1,0 +1,28 @@
+name: Set up Worker build tools
+description: Install worker-build, Binaryen, and Wrangler
+runs:
+  using: composite
+  steps:
+    - uses: ./workspace/cfwp/.github/actions/setup-rust
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - name: Update package index
+      shell: bash
+      run: sudo apt-get update
+    - name: Install Binaryen
+      shell: bash
+      run: sudo apt-get install --yes binaryen
+    - name: Install worker-build
+      shell: bash
+      working-directory: workspace/cfwp
+      run: cargo install worker-build --version 0.8.7 --locked
+    - name: Install Wrangler
+      shell: bash
+      run: npm install --global wrangler@4
+    - name: Verify build tools
+      shell: bash
+      run: wasm-opt --version
+    - name: Verify Wrangler
+      shell: bash
+      run: wrangler --version

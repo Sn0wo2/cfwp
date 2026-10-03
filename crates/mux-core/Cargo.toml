@@ -1,0 +1,15 @@
+[package]
+name = "mux-core"
+description = "Shared interfaces for stream multiplexing"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+socksaddr = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+name: Rust auto-fix
+
+on:
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: autofix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  autofix:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: Auto-fix Rust lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: workspace/cfwp
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref }}
+      - uses: ./workspace/cfwp/.github/actions/setup-rust
+      - name: Apply rustfmt
+        working-directory: workspace/cfwp
+        run: cargo fmt --all
+      - name: Apply Clippy fixes
+        working-directory: workspace/cfwp
+        run: cargo clippy --workspace --target wasm32-unknown-unknown --all-targets --all-features --fix --allow-dirty --allow-staged
+      - name: Create auto-fix pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          path: workspace/cfwp
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: auto-fix Rust formatting and lint"
+          branch: auto-fix/rust
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.event.repository.default_branch }}
+          delete-branch: true
+          title: "chore: auto-fix Rust formatting and lint"
+          body: "Automated rustfmt and Clippy fixes. Strict CI checks remain required on the source branch."
+          labels: |
+            automated
+            lint

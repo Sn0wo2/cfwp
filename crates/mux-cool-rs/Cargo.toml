@@ -1,0 +1,16 @@
+[package]
+name = "mux-cool-rs"
+description = "Xray mux.cool frame encoding and decoding"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mux-core = { workspace = true }
+socksaddr = { workspace = true }
+
+[lints]
+workspace = true

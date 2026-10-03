@@ -1,0 +1,15 @@
+[package]
+name = "yamux-rs"
+description = "yamux framing and flow control"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mux-core = { workspace = true }
+
+[lints]
+workspace = true

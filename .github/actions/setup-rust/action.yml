@@ -1,0 +1,17 @@
+name: Set up Rust workspace
+description: Install the pinned Rust toolchain and cache the workspace Cargo build
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        toolchain=nightly-2026-09-27
+        rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --component rust-src --target wasm32-unknown-unknown
+        echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: workspace/cfwp -> target
+        shared-key: cfwp-nightly
+        cache-on-failure: true

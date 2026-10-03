@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    uses: ./.github/workflows/verify.yml
+    secrets: inherit
+  worker:
+    name: Worker package (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: dns
+            features: dns
+          - name: proxy
+            features: proxy
+          - name: dns-proxy
+            features: dns,proxy
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: workspace/cfwp
+      - uses: ./workspace/cfwp/.github/actions/setup-worker
+      - name: Prepare Wrangler configuration
+        working-directory: workspace/cfwp
+        run: |
+          cp wrangler.example.toml wrangler.toml
+          sed -i 's|node scripts/build.js dev|node scripts/build.js release|' wrangler.toml
+      - name: Build and validate Worker
+        working-directory: workspace/cfwp
+        run: wrangler deploy --dry-run --config wrangler.toml
+        env:
+          CFWP_FEATURES: ${{ matrix.features }}
+      - name: Upload Worker package
+        uses: actions/upload-artifact@v7
+        with:
+          name: worker-${{ matrix.name }}
+          path: workspace/cfwp/build/**/*
+          if-no-files-found: error
+          retention-days: 7
