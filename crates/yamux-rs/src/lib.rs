@@ -78,7 +78,7 @@ impl Muxer for Decoder {
             }
             WU => {
                 buf.drain(..HEADER);
-                if events.is_empty() && length > 0 {
+                if length > 0 {
                     events.push(Event::Window {
                         sid,
                         delta: length as u32,
@@ -138,7 +138,7 @@ fn frame(typ: u8, flags: u16, sid: u32, length: u32, data: &[u8]) -> Vec<u8> {
 pub struct Windows {
     send: RefCell<HashMap<u32, u32>>,
     pending: RefCell<HashMap<u32, u32>>,
-    waker: RefCell<Option<Waker>>,
+    wakers: RefCell<HashMap<u32, Waker>>,
 }
 
 impl Windows {
@@ -151,7 +151,7 @@ impl Windows {
     pub fn close(&self, sid: u32) {
         self.send.borrow_mut().remove(&sid);
         self.pending.borrow_mut().remove(&sid);
-        if let Some(waker) = self.waker.borrow_mut().take() {
+        if let Some(waker) = self.wakers.borrow_mut().remove(&sid) {
             waker.wake();
         }
     }
@@ -159,7 +159,7 @@ impl Windows {
     pub fn clear(&self) {
         self.send.borrow_mut().clear();
         self.pending.borrow_mut().clear();
-        if let Some(waker) = self.waker.borrow_mut().take() {
+        for (_, waker) in self.wakers.borrow_mut().drain() {
             waker.wake();
         }
     }
@@ -180,7 +180,7 @@ impl Windows {
         if let Some(window) = self.send.borrow_mut().get_mut(&sid) {
             *window = window.saturating_add(delta);
         }
-        if let Some(waker) = self.waker.borrow_mut().take() {
+        if let Some(waker) = self.wakers.borrow_mut().remove(&sid) {
             waker.wake();
         }
     }
@@ -192,7 +192,7 @@ impl Windows {
                 return Poll::Ready(0);
             };
             if *window == 0 {
-                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                self.wakers.borrow_mut().insert(sid, cx.waker().clone());
                 return Poll::Pending;
             }
             let granted = (*window as usize).min(want);
@@ -200,5 +200,15 @@ impl Windows {
             Poll::Ready(granted)
         })
         .await
+    }
+
+    pub fn try_acquire(&self, sid: u32, want: usize) -> usize {
+        let mut send = self.send.borrow_mut();
+        let Some(window) = send.get_mut(&sid) else {
+            return 0;
+        };
+        let granted = (*window as usize).min(want);
+        *window -= granted as u32;
+        granted
     }
 }

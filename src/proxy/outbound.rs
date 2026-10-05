@@ -5,7 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::{Error, Result, Socket};
 
 use super::protocol::InitialRequest;
-use super::util::{CONNECT_TIMEOUT_MS, SocketTarget, connect_tcp, split_multi_value, with_timeout};
+use super::util::{CONNECT_TIMEOUT_MS, SocketTarget, connect_tcp, split_multi_value};
+use crate::util::with_timeout;
 
 #[derive(Clone, Debug)]
 pub(super) struct ProxyPlan {

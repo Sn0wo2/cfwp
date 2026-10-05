@@ -56,16 +56,6 @@ impl SocksAddr {
         Ok((addr.with_port(port), consumed + port_bytes.len()))
     }
 
-    pub fn write_socks(&self, out: &mut Vec<u8>) {
-        self.write_addr(out, true);
-        out.extend_from_slice(&self.port().to_be_bytes());
-    }
-
-    pub fn write_xray(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.port().to_be_bytes());
-        self.write_addr(out, false);
-    }
-
     pub fn host(&self) -> Cow<'_, str> {
         match self {
             Self::V4(addr) => Cow::Owned(addr.ip().to_string()),
@@ -102,26 +92,6 @@ impl SocksAddr {
                                 .iter()
                                 .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
                     })
-            }
-        }
-    }
-
-    fn write_addr(&self, out: &mut Vec<u8>, socks_family: bool) {
-        let domain_family = if socks_family { 3 } else { 2 };
-        match self {
-            Self::V4(addr) => {
-                out.push(1);
-                out.extend_from_slice(&addr.ip().octets());
-            }
-            Self::Domain(domain, _) => {
-                out.push(domain_family);
-                let domain_len = domain.len() % (usize::from(u8::MAX) + 1);
-                out.push(u8::try_from(domain_len).unwrap_or_default());
-                out.extend_from_slice(domain.as_bytes());
-            }
-            Self::V6(addr) => {
-                out.push(if socks_family { 4 } else { 3 });
-                out.extend_from_slice(&addr.ip().octets());
             }
         }
     }

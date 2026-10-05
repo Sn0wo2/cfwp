@@ -7,7 +7,7 @@ use std::task::{Poll, Waker};
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_util::StreamExt;
-use futures_util::future::{Either, select, select_all};
+use futures_util::future::{Either, select};
 use mux_core::{Event, Muxer};
 use socksaddr::{ParseError, SocksAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +15,8 @@ use tokio::sync::Semaphore;
 use worker::{Error, Result, WebSocket, WebsocketEvent};
 
 use super::protocol::{Codec, Decoder};
-use super::util::{CONNECT_TIMEOUT_MS, connect_tcp, with_timeout};
+use super::util::{CONNECT_TIMEOUT_MS, connect_tcp};
+use crate::util::with_timeout;
 
 pub(super) const SING_MUX_HOST: &str = "sp.mux.sing-box.arpa";
 pub(super) const SING_MUX_PORT: u16 = 444;
@@ -129,25 +130,23 @@ fn error_response(message: &str) -> Vec<u8> {
     payload
 }
 
-async fn queue_payload(
+fn send_control(
     outbox: &Outbox,
     muxer: &dyn Muxer,
     windows: Option<&yamux_rs::Windows>,
     sid: u32,
-    mut data: &[u8],
+    payload: &[u8],
 ) {
-    while !data.is_empty() {
-        let mut chunk = data.len().min(muxer.chunk_limit());
-        if let Some(windows) = windows {
-            chunk = chunk.min(windows.acquire(sid, chunk).await);
-            if chunk == 0 {
-                return;
-            }
-        }
-        let (head, tail) = data.split_at(chunk);
-        outbox.send_framed(muxer.data_frame(sid, head)).await;
-        data = tail;
+    let end = payload.len().min(muxer.chunk_limit());
+    if let Some(windows) = windows
+        && windows.try_acquire(sid, end) == 0
+    {
+        return;
     }
+    let Some(chunk) = payload.get(..end) else {
+        return;
+    };
+    outbox.send(muxer.data_frame(sid, chunk));
 }
 
 fn connect_future(sid: u32, target: &SocksAddr) -> Task {
@@ -284,6 +283,7 @@ pub(super) async fn handle(
         let mut decoder = decoder;
         let mut pending = pending;
         loop {
+            let buffered = pending.len();
             match reader_muxer.decode(&mut pending) {
                 Ok(events) if !events.is_empty() => {
                     for event in events {
@@ -291,6 +291,7 @@ pub(super) async fn handle(
                     }
                     continue;
                 }
+                Ok(_) if pending.len() < buffered => continue,
                 Ok(_) => {}
                 Err(err) => {
                     let err = Error::RustError(err.to_string());
@@ -346,7 +347,11 @@ pub(super) async fn handle(
             windows.close(sid);
         }
         if let Some(stream) = streams.remove(&sid) {
-            stream.shared.borrow_mut().close_read();
+            let mut shared = stream.shared.borrow_mut();
+            if let Some(bucket) = &bucket {
+                bucket.add(shared.buffered_len);
+            }
+            shared.close_read();
         }
     };
     let reset_stream = |streams: &mut HashMap<u32, Stream>, sid: u32| {
@@ -359,34 +364,30 @@ pub(super) async fn handle(
             break;
         }
 
-        let mut arms: Vec<Pin<Box<dyn Future<Output = LoopEvent> + '_>>> = Vec::new();
-        let mut reader_slot = None;
-        if !reader_done {
-            reader_slot = Some(arms.len());
-            arms.push(Box::pin(reader_fut.as_mut()));
-        }
-        let mut writer_slot = None;
-        if !writer_done {
-            writer_slot = Some(arms.len());
-            arms.push(Box::pin(writer_fut.as_mut()));
-        }
-        arms.push(Box::pin(async {
-            event_rx.next().await.unwrap_or(LoopEvent::ReaderDone)
-        }));
-        for stream in streams.values() {
-            if let StreamPhase::Active { fut } = &stream.phase {
-                let fut = Rc::clone(fut);
-                arms.push(Box::pin(poll_fn(move |cx| {
-                    fut.borrow_mut().as_mut().poll(cx)
-                })));
+        let (event, reader_finished, writer_finished) = poll_fn(|cx| {
+            if !reader_done && let Poll::Ready(event) = reader_fut.as_mut().poll(cx) {
+                return Poll::Ready((event, true, false));
             }
-        }
-
-        let (event, index, _) = select_all(arms).await;
-        if reader_slot == Some(index) {
+            if !writer_done && let Poll::Ready(event) = writer_fut.as_mut().poll(cx) {
+                return Poll::Ready((event, false, true));
+            }
+            if let Poll::Ready(event) = event_rx.poll_next_unpin(cx) {
+                return Poll::Ready((event.unwrap_or(LoopEvent::ReaderDone), false, false));
+            }
+            for stream in streams.values() {
+                if let StreamPhase::Active { fut } = &stream.phase
+                    && let Poll::Ready(event) = fut.borrow_mut().as_mut().poll(cx)
+                {
+                    return Poll::Ready((event, false, false));
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        if reader_finished {
             reader_done = true;
         }
-        if writer_slot == Some(index) {
+        if writer_finished {
             writer_done = true;
         }
         match event {
@@ -494,14 +495,13 @@ pub(super) async fn handle(
             LoopEvent::ConnectFailed(sid, err) => {
                 acta::warn!("mux: stream {sid} connect failed: {err:?}");
                 if mode == MuxMode::SingMux {
-                    queue_payload(
+                    send_control(
                         &outbox,
                         muxer.as_ref(),
                         windows.as_deref(),
                         sid,
                         &error_response("connect failed"),
-                    )
-                    .await;
+                    );
                 }
                 reset_stream(&mut streams, sid);
             }
@@ -559,11 +559,24 @@ pub(super) async fn handle(
             let parsed = parsed.map(|result| {
                 result.map(|((is_udp, target), consumed)| {
                     framed.drain(..2 + consumed);
-                    (is_udp, target)
+                    (is_udp, target, consumed)
                 })
             });
             match parsed {
-                Some(outcome) => resolved.push((*sid, outcome)),
+                Some(Ok((udp, target, consumed))) => {
+                    shared.buffered_len -= 2 + consumed;
+                    if let Some(bucket) = &bucket {
+                        bucket.add(2 + consumed);
+                    }
+                    if let Some(frame) = windows
+                        .as_ref()
+                        .and_then(|windows| windows.recv_forwarded(*sid, 2 + consumed))
+                    {
+                        outbox.send(frame);
+                    }
+                    resolved.push((*sid, Ok((udp, target))));
+                }
+                Some(Err(err)) => resolved.push((*sid, Err(err))),
                 None if eof => {
                     resolved.push((*sid, Err(Error::RustError("truncated mux request".into()))))
                 }
@@ -582,7 +595,7 @@ pub(super) async fn handle(
                         if udp { "udp" } else { "an invalid target" }
                     );
                     if mode == MuxMode::SingMux {
-                        queue_payload(
+                        send_control(
                             &outbox,
                             muxer.as_ref(),
                             windows.as_deref(),
@@ -592,8 +605,7 @@ pub(super) async fn handle(
                             } else {
                                 "invalid target"
                             }),
-                        )
-                        .await;
+                        );
                     }
                     reset_stream(&mut streams, sid);
                 }
@@ -608,14 +620,13 @@ pub(super) async fn handle(
                 Err(err) => {
                     acta::warn!("mux: stream {sid} request failed: {err:?}");
                     if mode == MuxMode::SingMux {
-                        queue_payload(
+                        send_control(
                             &outbox,
                             muxer.as_ref(),
                             windows.as_deref(),
                             sid,
                             &error_response("invalid request"),
-                        )
-                        .await;
+                        );
                     }
                     reset_stream(&mut streams, sid);
                 }
@@ -643,44 +654,40 @@ async fn pump_task(
 ) -> std::io::Result<(u64, u64)> {
     let (mut rd, mut wr) = tokio::io::split(socket);
     let mut buf = vec![0_u8; 64 * 1024];
-    let (mut up, mut down) = (0_u64, 0_u64);
-    let mut sock_open = true;
-    let mut target_closed = false;
 
-    loop {
-        let client_drained = {
-            let shared = shared.borrow_mut();
-            shared.eof && shared.buffered_len == 0
-        };
-        if client_drained && !target_closed {
-            wr.shutdown().await?;
-            target_closed = true;
-        }
-        if !sock_open && target_closed {
-            return Ok((up, down));
-        }
-
-        let read_step = async {
-            if !sock_open {
-                return std::future::pending::<std::io::Result<()>>().await;
-            }
+    let read_half = async {
+        let mut down = 0_u64;
+        loop {
             let n = rd.read(&mut buf).await?;
             if n == 0 {
-                sock_open = false;
                 outbox.send(muxer.eof_frame(sid));
-            } else {
-                let bytes = buf.get(..n).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid socket read length",
-                    )
-                })?;
-                queue_payload(&outbox, muxer.as_ref(), windows.as_deref(), sid, bytes).await;
-                down += n as u64;
+                return Ok::<u64, std::io::Error>(down);
             }
-            Ok(())
-        };
-        let write_step = async {
+            let bytes = buf.get(..n).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid socket read length",
+                )
+            })?;
+            let mut data = bytes;
+            while !data.is_empty() {
+                let mut chunk = data.len().min(muxer.chunk_limit());
+                if let Some(windows) = windows.as_deref() {
+                    chunk = chunk.min(windows.acquire(sid, chunk).await);
+                    if chunk == 0 {
+                        break;
+                    }
+                }
+                let (head, tail) = data.split_at(chunk);
+                outbox.send_framed(muxer.data_frame(sid, head)).await;
+                data = tail;
+            }
+            down += n as u64;
+        }
+    };
+    let write_half = async {
+        let mut up = 0_u64;
+        loop {
             let has_data = poll_fn(|cx| {
                 let mut shared = shared.borrow_mut();
                 if shared.buffered_len > 0 {
@@ -694,12 +701,8 @@ async fn pump_task(
             })
             .await;
             if !has_data {
-                if target_closed {
-                    return std::future::pending::<std::io::Result<()>>().await;
-                }
                 wr.shutdown().await?;
-                target_closed = true;
-                return Ok(());
+                return Ok::<u64, std::io::Error>(up);
             }
             let chunk = {
                 let mut shared = shared.borrow_mut();
@@ -723,10 +726,18 @@ async fn pump_task(
             };
             wr.write_all(&chunk).await?;
             up += chunk.len() as u64;
-            Ok(())
-        };
-        match select(pin!(read_step), pin!(write_step)).await {
-            Either::Left((result, _)) | Either::Right((result, _)) => result?,
+        }
+    };
+    match select(pin!(read_half), pin!(write_half)).await {
+        Either::Left((result, write_half)) => {
+            let down = result?;
+            let up = write_half.await?;
+            Ok((up, down))
+        }
+        Either::Right((result, read_half)) => {
+            let up = result?;
+            let down = read_half.await?;
+            Ok((up, down))
         }
     }
 }

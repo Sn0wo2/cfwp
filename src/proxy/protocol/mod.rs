@@ -1,6 +1,7 @@
 mod shadowsocks;
 mod vmess;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use aes::Aes128;
@@ -58,10 +59,10 @@ impl Codec {
 }
 
 impl Decoder {
-    pub(super) async fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+    pub(super) async fn decode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self {
-            Self::Plain => Ok(bytes.to_vec()),
-            Self::Shadowsocks(decoder) => decoder.decode(bytes).await,
+            Self::Plain => Ok(Cow::Borrowed(bytes)),
+            Self::Shadowsocks(decoder) => decoder.decode(bytes).await.map(Cow::Owned),
             Self::Vmess(decoder) => {
                 if decoder.ended && !bytes.is_empty() {
                     return Err(vmess::invalid_at("body data after end marker"));
@@ -153,7 +154,7 @@ impl Decoder {
                             break;
                         }
                     }
-                    Ok(result)
+                    Ok(Cow::Owned(result))
                 };
                 decoder.pending.drain(..pos);
                 decoded.and_then(|result| {
@@ -169,16 +170,19 @@ impl Decoder {
 }
 
 impl Encoder {
-    pub(super) async fn encode(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+    pub(super) async fn encode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self {
-            Self::Plain { response_header } => {
-                let mut result = response_header.take().unwrap_or_default();
-                result.extend_from_slice(bytes);
-                Ok(result)
-            }
+            Self::Plain { response_header } => response_header.take().map_or_else(
+                || Ok(Cow::Borrowed(bytes)),
+                |header| {
+                    let mut result = header;
+                    result.extend_from_slice(bytes);
+                    Ok(Cow::Owned(result))
+                },
+            ),
             Self::Shadowsocks(encoder) => {
                 if bytes.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(Cow::Borrowed(bytes));
                 }
                 let tag_len = encoder.cipher.tag_len();
                 let mut encrypted = encoder.salt.take().unwrap_or_default();
@@ -190,7 +194,7 @@ impl Encoder {
                     encrypted.extend_from_slice(&encoder.cipher.encrypt(&length).await?);
                     encrypted.extend_from_slice(&encoder.cipher.encrypt(chunk).await?);
                 }
-                Ok(encrypted)
+                Ok(Cow::Owned(encrypted))
             }
             Self::Vmess(encoder) => {
                 let mut output = encoder.header.take().unwrap_or_default();
@@ -225,7 +229,7 @@ impl Encoder {
                         .checked_add(1)
                         .ok_or_else(|| vmess::invalid_at("response chunk counter exhausted"))?;
                 }
-                Ok(output)
+                Ok(Cow::Owned(output))
             }
         }
     }
@@ -573,7 +577,8 @@ impl InitialRequest {
                         .get(total..)
                         .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
                 )
-                .await?;
+                .await?
+                .into_owned();
             break 'vmess Some(request);
         } {
             acta::info!("protocol: vmess selected");

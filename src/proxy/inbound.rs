@@ -12,7 +12,8 @@ use worker::{
 
 use super::outbound::ProxyPlan;
 use super::protocol::{Codec, InitialRequest};
-use super::util::{CONNECT_TIMEOUT_MS, connect_tcp, with_timeout};
+use super::util::{CONNECT_TIMEOUT_MS, connect_tcp};
+use crate::util::with_timeout;
 
 #[allow(clippy::single_call_fn)]
 pub(crate) async fn handle(
@@ -128,7 +129,7 @@ pub(crate) async fn handle(
                     Ok(Some(mut request)) => {
                         if !trailing.is_empty() {
                             let decoded = request.codec.inbound.decode(&trailing).await?;
-                            request.payload.extend(decoded);
+                            request.payload.extend_from_slice(&decoded);
                         }
                         break Ok(request);
                     }
@@ -269,7 +270,9 @@ pub(crate) async fn handle(
                     match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
                             if let Some(bytes) = decode_message(message) {
-                                pending.extend(request.codec.inbound.decode(&bytes).await?);
+                                pending.extend_from_slice(
+                                    &request.codec.inbound.decode(&bytes).await?,
+                                );
                             }
                         }
                         Some(Ok(WebsocketEvent::Close(_))) | None => {
