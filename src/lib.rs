@@ -6,6 +6,8 @@ mod config;
 mod dns;
 
 #[cfg(feature = "dns")]
+use crate::dns::DnsError;
+#[cfg(feature = "dns")]
 use crate::dns::util::read_body;
 #[cfg(feature = "dns")]
 use base64::Engine;
@@ -13,6 +15,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 #[cfg(feature = "proxy")]
 mod proxy;
+mod util;
 
 use worker::*;
 
@@ -68,16 +71,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
                 match read_body(req.stream()?, limit).await {
                     Ok(bytes) => bytes,
-                    Err(err) => {
-                        return error(
-                            "Invalid or oversized DNS body",
-                            if err.to_string().contains("too large") {
-                                413
-                            } else {
-                                400
-                            },
-                        );
-                    }
+                    Err(DnsError::TooLarge) => return error("Invalid or oversized DNS body", 413),
+                    Err(_) => return error("Invalid or oversized DNS body", 400),
                 }
             }
             _ => {
@@ -92,16 +87,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .and_then(|value| value.parse().ok());
         let prepared = match config.dns.prepare(&payload, client_ip) {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return error(
-                    "Invalid or oversized DNS query",
-                    if err.to_string().contains("too large") {
-                        413
-                    } else {
-                        400
-                    },
-                );
-            }
+            Err(DnsError::TooLarge) => return error("Invalid or oversized DNS query", 413),
+            Err(_) => return error("Invalid or oversized DNS query", 400),
         };
         return match config.dns.exchange_prepared(prepared).await {
             Ok(bytes) => {
@@ -115,7 +102,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 acta::error!("DNS exchange failed: {err}");
                 error(
                     "DNS upstream unavailable",
-                    if err.to_string().contains("timed out") {
+                    if matches!(err, DnsError::Timeout(_)) {
                         504
                     } else {
                         502

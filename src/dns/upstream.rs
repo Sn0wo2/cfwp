@@ -1,24 +1,32 @@
-use std::{cell::RefCell, future::Future, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use domain::base::iana::OptRcode;
-use futures_util::{FutureExt, StreamExt, future::select, stream::FuturesUnordered};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::{
-    AbortController, Delay, Env, Error, Fetch, Headers, Method, Request, RequestInit, Result,
-    Socket, Url,
+    AbortController, Env, Error, Fetch, Headers, Method, Request, RequestInit, Result, Socket, Url,
 };
 
+use crate::util::with_timeout;
 use crate::wasm_bindgen::JsValue;
 
 use super::{
-    DnsService,
+    DnsError, DnsResult, DnsService,
     cache::DnsCache,
     config::{self, DnsConfig, Strategy},
     util::read_body,
     wire,
 };
+
+const PROBE_TIMEOUT_MS: u32 = 1_000;
+
+type ProbeOrder = Option<(Rc<str>, Rc<[usize]>)>;
+
+thread_local! {
+    static PROBE_ORDER: RefCell<ProbeOrder> = const { RefCell::new(None) };
+}
 
 #[derive(Clone)]
 pub(super) struct UpstreamPool {
@@ -29,6 +37,7 @@ pub(super) struct UpstreamPool {
     race_concurrency: usize,
     probe: Option<Rc<[u16]>>,
     max_message_bytes: usize,
+    probe_key: Rc<str>,
     probe_order_cache: Rc<RefCell<Option<Rc<[usize]>>>>,
 }
 
@@ -53,11 +62,16 @@ enum Transport {
 impl DnsService {
     #[allow(clippy::single_call_fn)]
     pub(crate) fn new(env: &Env, origin: &str, user_id: &str) -> Result<Self> {
-        let config: DnsConfig = match env.var("DNS").ok() {
-            Some(value) => serde_json::from_str(&value.to_string())
+        let dns_env = env.var("DNS").ok().map(|value| value.to_string());
+        let config: DnsConfig = match &dns_env {
+            Some(value) => serde_json::from_str(value)
                 .map_err(|err| Error::RustError(format!("DNS is invalid: {err}")))?,
             None => DnsConfig::default(),
         };
+        let probe_key: Rc<str> = Rc::from(format!(
+            "{origin}\0{user_id}\0{}",
+            dns_env.as_deref().unwrap_or_default()
+        ));
 
         if config.upstreams.is_empty() {
             return Err(config::config_error(
@@ -196,25 +210,29 @@ impl DnsService {
                 timeout_ms: config.timeout_ms,
                 request_timeout_ms: config.request_timeout_ms,
                 race_concurrency: config.race_concurrency,
-                probe: Some(Rc::from(config.probe.as_deref().map_or_else(
-                    Vec::new,
-                    |value| {
+                probe: config.probe.as_deref().map(|value| {
+                    Rc::from(
                         value
-                        .split([',', '\n'])
-                        .filter_map(|entry| {
-                            let entry = entry.trim();
-                            let (scheme, port) = entry.split_once(':')?;
-                            if scheme != "tcp" {
-                                return None;
-                            }
-                            let port = port.parse::<u16>().ok()?;
-                            (port != 0).then_some(port)
-                        })
-                        .collect()
-                    },
-                ))),
+                            .split([',', '\n'])
+                            .filter_map(|entry| {
+                                let entry = entry.trim();
+                                let (scheme, port) = entry.split_once(':')?;
+                                if scheme != "tcp" {
+                                    return None;
+                                }
+                                let port = port.parse::<u16>().ok()?;
+                                (port != 0).then_some(port)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }),
                 max_message_bytes: config.max_message_bytes,
-                probe_order_cache: Rc::new(RefCell::new(None)),
+                probe_key: Rc::clone(&probe_key),
+                probe_order_cache: Rc::new(RefCell::new(PROBE_ORDER.with(|order| {
+                    order.borrow().as_ref().and_then(|(key, order)| {
+                        (key.as_ref() == probe_key.as_ref()).then(|| Rc::clone(order))
+                    })
+                }))),
             },
             cache: config
                 .cache
@@ -243,19 +261,17 @@ impl UpstreamPool {
         &self,
         query: &[u8],
         retry_without_ecs: Option<&[u8]>,
-    ) -> Result<UpstreamResponse> {
+    ) -> DnsResult<UpstreamResponse> {
         if query.len() < 12 {
-            return Err(Error::RustError(
-                "DNS query is shorter than its header".into(),
-            ));
+            return Err(Error::RustError("DNS query is shorter than its header".into()).into());
         }
         if query.len() > self.max_message_bytes {
-            return Err(Error::RustError("DNS query is too large".into()));
+            return Err(Error::RustError("DNS query is too large".into()).into());
         }
 
         let operation = async {
             match self.strategy {
-                Strategy::None => self.exchange_in_order(query, retry_without_ecs, 0).await,
+                Strategy::None => Ok(self.exchange_in_order(query, retry_without_ecs, 0).await?),
                 Strategy::FastestV4 | Strategy::FastestV6 | Strategy::FastestAll => {
                     let start = if self.probe.is_none() {
                         0
@@ -268,6 +284,9 @@ impl UpstreamPool {
                             Error::RustError("DNS probe configuration is unavailable".into())
                         })?;
                         let mut latencies: Vec<(usize, Option<u32>)> = Vec::new();
+                        let probe_budget =
+                            f64::from(self.request_timeout_ms / 2).max(f64::from(PROBE_TIMEOUT_MS));
+                        let probe_started = js_sys::Date::now();
                         for (index, upstream) in self.upstreams.iter().enumerate() {
                             let target = match &upstream.transport {
                                 Transport::Https { url } => Url::parse(url).ok().and_then(|url| {
@@ -290,7 +309,14 @@ impl UpstreamPool {
                             }
                             let mut latency = None;
                             for port in probes {
-                                let ms = async {
+                                let remaining =
+                                    probe_budget - (js_sys::Date::now() - probe_started);
+                                if remaining <= 0.0 {
+                                    break;
+                                }
+                                let deadline = remaining.min(f64::from(PROBE_TIMEOUT_MS));
+                                #[allow(clippy::cast_sign_loss)]
+                                let ms = with_timeout(deadline as u32, async {
                                     let started = js_sys::Date::now();
                                     let socket =
                                         Socket::builder().connect(host.to_string(), *port).ok()?;
@@ -304,8 +330,9 @@ impl UpstreamPool {
                                         as u32;
                                     drop(socket);
                                     Some(elapsed)
-                                }
-                                .await;
+                                })
+                                .await
+                                .flatten();
                                 if let Some(ms) = ms {
                                     acta::info!("DNS probe {host}:{port} -> {ms} ms");
                                     latency = Some(ms);
@@ -316,14 +343,23 @@ impl UpstreamPool {
                         }
                         latencies
                             .sort_by_key(|(index, latency)| (latency.unwrap_or(u32::MAX), *index));
-                        let order: Vec<usize> =
-                            latencies.into_iter().map(|(index, _)| index).collect();
+                        let order: Rc<[usize]> = Rc::from(
+                            latencies
+                                .into_iter()
+                                .map(|(index, _)| index)
+                                .collect::<Vec<_>>(),
+                        );
                         let first = order.first().copied().unwrap_or(0);
-                        *self.probe_order_cache.borrow_mut() = Some(Rc::from(order));
+                        *self.probe_order_cache.borrow_mut() = Some(Rc::clone(&order));
+                        PROBE_ORDER.with(|cache| {
+                            *cache.borrow_mut() =
+                                Some((Rc::clone(&self.probe_key), Rc::clone(&order)));
+                        });
                         first
                     };
-                    self.exchange_in_order(query, retry_without_ecs, start)
-                        .await
+                    Ok(self
+                        .exchange_in_order(query, retry_without_ecs, start)
+                        .await?)
                 }
                 Strategy::First => {
                     let mut pending = FuturesUnordered::new();
@@ -356,20 +392,20 @@ impl UpstreamPool {
                         }
                     }
 
-                    last_dns_error.map_or_else(
+                    Ok(last_dns_error.map_or_else(
                         || {
                             Err(last_error.unwrap_or_else(|| {
                                 Error::RustError("no DNS upstream available".into())
                             }))
                         },
                         Ok,
-                    )
+                    )?)
                 }
             }
         };
         with_timeout(self.request_timeout_ms, operation)
             .await
-            .unwrap_or_else(|| Err(timeout_error("DNS request", self.request_timeout_ms)))
+            .unwrap_or_else(|| Err(DnsError::Timeout(self.request_timeout_ms)))
     }
 
     async fn exchange_in_order(
@@ -413,16 +449,23 @@ impl UpstreamPool {
             if let Some(retry_query) = retry_without_ecs
                 && wire::parse_message(&bytes)?.rcode == OptRcode::REFUSED
             {
-                return Ok(self.exchange_one_query(index, retry_query).await.map_or(
-                    UpstreamResponse {
-                        bytes,
-                        retried_without_ecs: true,
-                    },
-                    |bytes| UpstreamResponse {
-                        bytes,
-                        retried_without_ecs: true,
-                    },
-                ));
+                return self
+                    .exchange_one_query(index, retry_query)
+                    .await
+                    .map_or_else(
+                        |_| {
+                            Ok(UpstreamResponse {
+                                bytes,
+                                retried_without_ecs: false,
+                            })
+                        },
+                        |bytes| {
+                            Ok(UpstreamResponse {
+                                bytes,
+                                retried_without_ecs: true,
+                            })
+                        },
+                    );
             }
             Ok(UpstreamResponse {
                 bytes,
@@ -430,7 +473,11 @@ impl UpstreamPool {
             })
         })
         .await
-        .unwrap_or_else(|| Err(timeout_error("DNS upstream", timeout_ms)))
+        .unwrap_or_else(|| {
+            Err(Error::RustError(format!(
+                "DNS upstream timed out after {timeout_ms} ms"
+            )))
+        })
     }
 
     async fn exchange_one_query(&self, index: usize, query: &[u8]) -> Result<Vec<u8>> {
@@ -571,23 +618,6 @@ async fn exchange_socket(
     });
     socket.0.take();
     result
-}
-
-async fn with_timeout<F>(timeout_ms: u32, future: F) -> Option<F::Output>
-where
-    F: Future,
-{
-    let future = future.fuse();
-    let timer = Delay::from(Duration::from_millis(u64::from(timeout_ms))).fuse();
-    futures_util::pin_mut!(future, timer);
-    match select(future, timer).await {
-        futures_util::future::Either::Left((result, _)) => Some(result),
-        futures_util::future::Either::Right(((), _)) => None,
-    }
-}
-
-fn timeout_error(kind: &str, timeout_ms: u32) -> Error {
-    Error::RustError(format!("{kind} timed out after {timeout_ms} ms"))
 }
 
 struct AbortOnDrop(Option<AbortController>);

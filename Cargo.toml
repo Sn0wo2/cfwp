@@ -47,7 +47,6 @@ proxy = [
   "dep:mux-cool-rs",
   "dep:percent-encoding",
   "dep:sha1",
-  "dep:sha2",
   "dep:sha3",
   "dep:shake",
   "dep:shadowsocks-crypto",
@@ -58,7 +57,7 @@ proxy = [
   "dep:wasm-bindgen-futures",
   "dep:yamux-rs",
 ]
-dns = ["dep:domain", "dep:serde", "dep:serde_json", "dep:sha2"]
+dns = ["dep:domain", "dep:serde", "dep:serde_json"]
 
 [profile.release]
 lto = true
@@ -82,22 +81,22 @@ domain = { version = "0.12", default-features = false, features = [
 futures-channel = { version = "0.3", optional = true }
 futures-util = "0.3"
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-hashlink = { version = "0.12.2", optional = true }
+hashlink = { version = "0.12", optional = true }
 hkdf = { version = "0.13", optional = true }
 hex = { version = "0.4", optional = true }
 httparse = { version = "1", optional = true }
 leb128 = { version = "0.2", optional = true }
 js-sys = "0.3"
-md5 = { version = "0.8.1", optional = true }
+md5 = { version = "0.8", optional = true }
 mux-core = { workspace = true, optional = true }
 mux-cool-rs = { workspace = true, optional = true }
 percent-encoding = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha1 = { version = "0.11", optional = true }
+sha2 = "0.11"
 sha3 = { version = "0.12", optional = true }
 shake = { version = "0.1", optional = true }
-sha2 = { version = "0.11", optional = true }
 tokio = { version = "1", features = ["io-util", "sync"] }
 uuid = "1"
 wasm-bindgen = { version = "0.2", optional = true }

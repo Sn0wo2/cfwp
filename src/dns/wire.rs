@@ -10,7 +10,7 @@ use futures_util::{FutureExt, future::select};
 use sha2::{Digest, Sha256};
 use worker::{Cache, Delay, Error, Headers, Response, Result};
 
-use super::{DnsService, config::AddressFamily, util::read_body};
+use super::{DnsError, DnsResult, DnsService, config::AddressFamily, util::read_body};
 
 const DNS_MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 const DEFAULT_UDP_PAYLOAD_SIZE: u16 = 1232;
@@ -65,20 +65,20 @@ pub(super) struct ParsedMessage {
 
 #[allow(clippy::multiple_inherent_impl)]
 impl DnsService {
-    pub(crate) fn prepare(&self, payload: &[u8], client_ip: Option<IpAddr>) -> Result<Prepared> {
+    pub(crate) fn prepare(&self, payload: &[u8], client_ip: Option<IpAddr>) -> DnsResult<Prepared> {
         if payload.len() > self.config.max_message_bytes {
-            return Err(Error::RustError("DNS query too large".into()));
+            return Err(DnsError::TooLarge);
         }
 
         let parsed = parse_message(payload)?;
         if parsed.qr {
-            return Err(wire_error("expected a DNS query"));
+            return Err(wire_error("expected a DNS query").into());
         }
         if parsed.opcode != Opcode::QUERY {
-            return Err(wire_error("only standard DNS queries are supported"));
+            return Err(wire_error("only standard DNS queries are supported").into());
         }
         if parsed.question_count == 0 {
-            return Err(wire_error("DNS query has no question"));
+            return Err(wire_error("DNS query has no question").into());
         }
 
         let policy = self.config.address_family;
@@ -91,12 +91,14 @@ impl DnsService {
             if parsed.question_count != 1 {
                 return Err(wire_error(
                     "address-family filtering requires a single-question DNS query",
-                ));
+                )
+                .into());
             }
             if parsed.signed {
                 return Err(wire_error(
                     "cannot synthesize an address-family response for a signed DNS query",
-                ));
+                )
+                .into());
             }
             return Ok(Prepared {
                 bytes: make_nodata_response(payload, parsed.question_end)?,
@@ -119,12 +121,14 @@ impl DnsService {
             if parsed.question_count != 1 {
                 return Err(wire_error(
                     "address-family preference requires a single-question DNS query",
-                ));
+                )
+                .into());
             }
             if parsed.signed {
                 return Err(wire_error(
                     "cannot rewrite a signed DNS query for address-family preference",
-                ));
+                )
+                .into());
             }
         }
 
@@ -214,9 +218,7 @@ impl DnsService {
         }
 
         if bytes.len() > self.config.max_message_bytes {
-            return Err(Error::RustError(
-                "DNS query too large after ECS injection".into(),
-            ));
+            return Err(Error::RustError("DNS query too large after ECS injection".into()).into());
         }
 
         Ok(Prepared {
@@ -231,7 +233,7 @@ impl DnsService {
         })
     }
 
-    pub(crate) async fn exchange_prepared(&self, prepared: Prepared) -> Result<Vec<u8>> {
+    pub(crate) async fn exchange_prepared(&self, prepared: Prepared) -> DnsResult<Vec<u8>> {
         if prepared.local_response {
             return Ok(prepared.bytes);
         }
@@ -274,7 +276,7 @@ impl DnsService {
         fallback: Prepared,
         probe: Prepared,
         preferred_type: Rtype,
-    ) -> Result<Vec<u8>> {
+    ) -> DnsResult<Vec<u8>> {
         let fallback_query = fallback.bytes.clone();
         let question_end = fallback.question_end;
         let timeout_ms = self.config.request_timeout_ms;
@@ -290,7 +292,7 @@ impl DnsService {
                         if let Ok(response) = probe_result
                             && response_has_address_answer(&response, preferred_type)?
                         {
-                            return make_nodata_response(&fallback_query, question_end);
+                            return Ok(make_nodata_response(&fallback_query, question_end)?);
                         }
                     }
                     futures_util::future::Either::Right(((), _)) => {}
@@ -301,19 +303,19 @@ impl DnsService {
                 if let Ok(response) = probe_result
                     && response_has_address_answer(&response, preferred_type)?
                 {
-                    return make_nodata_response(&fallback_query, question_end);
+                    return Ok(make_nodata_response(&fallback_query, question_end)?);
                 }
                 match select(fallback, timer).await {
                     futures_util::future::Either::Left((fallback_result, _)) => fallback_result,
-                    futures_util::future::Either::Right(((), _)) => Err(Error::RustError(format!(
-                        "DNS request timed out after {timeout_ms} ms"
-                    ))),
+                    futures_util::future::Either::Right(((), _)) => {
+                        Err(DnsError::Timeout(timeout_ms))
+                    }
                 }
             }
         }
     }
 
-    async fn exchange_query(&self, prepared: Prepared) -> Result<Vec<u8>> {
+    async fn exchange_query(&self, prepared: Prepared) -> DnsResult<Vec<u8>> {
         let cache_key = self
             .cache
             .as_ref()
