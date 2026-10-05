@@ -43,5 +43,5 @@ if (mode === "release") {
     existsSync(resolve(root, path)),
   );
   if (!wasm) throw new Error("Worker build did not produce a Wasm module");
-  run("wasm-opt", [wasm, "--strip-debug", "--strip-producers", "-o", wasm]);
+  run("wasm-opt", [wasm, "-Oz", "--strip-debug", "--strip-producers", "-o", wasm]);
 }
