@@ -22,14 +22,22 @@ use worker::*;
 #[allow(clippy::single_call_fn)]
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    let _acta_guard = acta::init(
-        acta::Writer::stdout()
-            .with_style(acta::Style {
-                icons: acta::Icons::NERD,
-                ..acta::Style::default()
-            })
-            .with_color_depth(acta::ColorDepth::TrueColor),
-    );
+    static ACTA_GUARD: std::sync::OnceLock<Option<acta::TracingGuard>> = std::sync::OnceLock::new();
+    let _ = ACTA_GUARD.get_or_init(|| {
+        acta::init(
+            acta::Config::builder()
+                .with_writers([acta::Writer::stdout()
+                    .with_format(acta::Format::Compact(acta::Formatter::new().with_style(
+                        acta::Style {
+                            icons: acta::Icons::NERD,
+                            ..acta::Style::default()
+                        },
+                    )))
+                    .with_color_depth(acta::ColorDepth::TrueColor)])
+                .build(),
+        )
+        .ok()
+    });
 
     let url = req.url()?;
     #[cfg(feature = "dns")]
@@ -99,7 +107,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Ok(Response::from_bytes(bytes)?.with_headers(headers))
             }
             Err(err) => {
-                acta::error!("DNS exchange failed: {err}");
+                tracing::error!("DNS exchange failed: {err}");
                 error(
                     "DNS upstream unavailable",
                     if matches!(err, DnsError::Timeout(_)) {
@@ -120,12 +128,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .flatten()
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
     {
-        acta::info!("fetch: websocket upgrade requested");
+        tracing::info!("fetch: websocket upgrade requested");
         let config = config::Config::from_env(&env, &url)?;
         return proxy::handle(&env, &config, req, _ctx).await;
     }
 
-    acta::info!("fetch: request without websocket upgrade");
+    tracing::info!("fetch: request without websocket upgrade");
     Response::from_json(&std::collections::BTreeMap::from([(
         "msg",
         "cfwp working!",

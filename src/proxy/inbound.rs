@@ -27,7 +27,7 @@ pub(crate) async fn handle(
     if request_url.path().strip_prefix('/') != Some(user_id.as_str())
         && request_url.path().strip_prefix('/') != Some(user_id.replace('-', "").as_str())
     {
-        acta::error!("fetch: websocket path mismatch");
+        tracing::error!("fetch: websocket path mismatch");
         return Response::error("Not Found", 404);
     }
 
@@ -73,7 +73,7 @@ pub(crate) async fn handle(
     let websocket = pair.server;
 
     ctx.wait_until(async move {
-        acta::info!("session: websocket accepted");
+        tracing::info!("session: websocket accepted");
         let cleanup_websocket = websocket.clone();
         if let Err(err) = async move {
             let mut events = websocket.events()?;
@@ -84,19 +84,19 @@ pub(crate) async fn handle(
                     .decode(early_data.as_bytes())
                     .or_else(|_| URL_SAFE.decode(early_data.as_bytes()))
                     .unwrap_or_else(|err| {
-                        acta::error!("session: ignoring invalid early data: {err}");
+                        tracing::error!("session: ignoring invalid early data: {err}");
                         Vec::new()
                     })
             };
             if !initial.is_empty() {
-                acta::info!("session: early data received ({} bytes)", initial.len());
+                tracing::info!("session: early data received ({} bytes)", initial.len());
             }
             while initial.is_empty() {
                 match events.next().await {
                     Some(event) => match event? {
                         WebsocketEvent::Message(message) => {
                             if let Some(payload) = decode_message(message) {
-                                acta::info!(
+                                tracing::info!(
                                     "session: first websocket message ({} bytes)",
                                     payload.len()
                                 );
@@ -104,7 +104,7 @@ pub(crate) async fn handle(
                             }
                         }
                         WebsocketEvent::Close(_) => {
-                            acta::info!("session: websocket closed before first message");
+                            tracing::info!("session: websocket closed before first message");
                             break;
                         }
                     },
@@ -112,13 +112,13 @@ pub(crate) async fn handle(
                 }
             }
             if initial.is_empty() {
-                acta::info!("session: closed without an initial payload");
+                tracing::info!("session: closed without an initial payload");
                 websocket.close(None, None::<String>)?;
                 return Ok(());
             }
 
             const MAX_INITIAL_HEADER: usize = 64 * 1024;
-            acta::info!("session: parsing initial payload ({} bytes)", initial.len());
+            tracing::info!("session: parsing initial payload ({} bytes)", initial.len());
             let mut trailing = if initial.len() > MAX_INITIAL_HEADER {
                 initial.split_off(MAX_INITIAL_HEADER)
             } else {
@@ -136,7 +136,7 @@ pub(crate) async fn handle(
                     Ok(None) if initial.len() < MAX_INITIAL_HEADER => match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
                             if let Some(bytes) = decode_message(message) {
-                                acta::info!("session: continued header ({} bytes)", bytes.len());
+                                tracing::info!("session: continued header ({} bytes)", bytes.len());
                                 let remaining = MAX_INITIAL_HEADER - initial.len();
                                 if bytes.len() > remaining {
                                     let header = bytes.get(..remaining).ok_or_else(|| {
@@ -168,12 +168,12 @@ pub(crate) async fn handle(
             } {
                 Ok(request) => request,
                 Err(err) => {
-                    acta::error!("session: request parse failed: {err:?}");
+                    tracing::error!("session: request parse failed: {err:?}");
                     drop(websocket.close(Some(1008), Some("invalid request")));
                     return Err(err);
                 }
             };
-            acta::info!("session: request parsed (port={})", request.port);
+            tracing::info!("session: request parsed (port={})", request.port);
 
             let hostname = request.hostname.as_str();
             if request.port == 0
@@ -200,7 +200,7 @@ pub(crate) async fn handle(
                                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
                             })))
             {
-                acta::error!("session: invalid target authority");
+                tracing::error!("session: invalid target authority");
                 drop(websocket.close(Some(1008), Some("invalid request")));
                 return Err(worker::Error::RustError("invalid target authority".into()));
             }
@@ -217,14 +217,14 @@ pub(crate) async fn handle(
             #[cfg(not(feature = "dns"))]
             let udp_only = request.is_udp;
             if udp_only {
-                acta::info!("session: UDP request unsupported");
+                tracing::info!("session: UDP request unsupported");
                 websocket.close(Some(1003), Some("udp unsupported"))?;
                 return Ok(());
             }
 
             #[cfg(feature = "dns")]
             if request.is_dns_request() {
-                acta::info!("session: forwarding DNS request");
+                tracing::info!("session: forwarding DNS request");
                 let mut pending = std::mem::take(&mut request.payload);
                 loop {
                     while pending.len() >= 2 {
@@ -288,12 +288,12 @@ pub(crate) async fn handle(
             }
 
             if let Some(mode) = request.mux_mode() {
-                acta::info!("session: mux session accepted ({mode:?})");
+                tracing::info!("session: mux session accepted ({mode:?})");
                 let InitialRequest { payload, codec, .. } = request;
                 return super::mux::handle(&websocket, events, codec, payload, mode).await;
             }
 
-            acta::info!("session: connecting primary target (port={})", request.port);
+            tracing::info!("session: connecting primary target (port={})", request.port);
             #[cfg(feature = "dns")]
             let hostname = match dns.as_deref() {
                 Some(dns) => {
@@ -356,7 +356,7 @@ pub(crate) async fn handle(
                         Ok(Some(ip)) => ip.to_string(),
                         Ok(None) => request.hostname.clone(),
                         Err(err) => {
-                            acta::warn!("session: DNS resolution failed, using hostname: {err}");
+                            tracing::warn!("session: DNS resolution failed, using hostname: {err}");
                             request.hostname.clone()
                         }
                     }
@@ -391,7 +391,7 @@ pub(crate) async fn handle(
                 },
             } {
                 Ok(mut socket) => {
-                    acta::info!("session: primary connection opened");
+                    tracing::info!("session: primary connection opened");
                     let (has_data, has_client_data) = match pipe_streams(
                         &websocket,
                         &mut events,
@@ -407,12 +407,12 @@ pub(crate) async fn handle(
                         }
                     };
                     drop(socket.close().await);
-                    acta::info!("session: primary stream ended (remote_data={has_data})");
+                    tracing::info!("session: primary stream ended (remote_data={has_data})");
                     if has_data || has_client_data || !plan.has_entries() {
                         websocket.close(None, None::<String>)?;
                         return Ok(());
                     }
-                    acta::info!("session: trying alternate route after empty response");
+                    tracing::info!("session: trying alternate route after empty response");
                     let mut fallback = plan.connect_via_entries(&request).await?;
                     if let Err(err) =
                         pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
@@ -426,11 +426,11 @@ pub(crate) async fn handle(
                     Ok(())
                 }
                 Err(err) => {
-                    acta::error!("session: primary connection failed: {err:?}");
+                    tracing::error!("session: primary connection failed: {err:?}");
                     if !plan.has_entries() {
                         return Err(err);
                     }
-                    acta::info!("session: trying alternate route");
+                    tracing::info!("session: trying alternate route");
                     let mut fallback = plan.connect_via_entries(&request).await?;
                     if let Err(err) =
                         pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
@@ -447,7 +447,7 @@ pub(crate) async fn handle(
         }
         .await
         {
-            acta::error!("channel task failed: {err:?}");
+            tracing::error!("channel task failed: {err:?}");
             drop(cleanup_websocket.close(Some(1011), Some("internal error")));
         }
     });

@@ -67,7 +67,7 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
-acta = { version = "0.4.0", default-features = false, features = [
+acta = { version = "0.5.3", default-features = false, features = [
   "nerd",
   "wasm-console",
 ] }
@@ -98,6 +98,7 @@ sha2 = "0.11"
 sha3 = { version = "0.12", optional = true }
 shake = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["io-util", "sync"] }
+tracing = "0.1"
 uuid = "1"
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }

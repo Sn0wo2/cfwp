@@ -33,7 +33,7 @@ impl ProxyPlan {
         let mut last_error = None;
 
         for entry in &self.entries {
-            acta::info!(
+            tracing::info!(
                 "alternate route attempt: {} -> {}:{}",
                 entry.kind_name(),
                 target.hostname,
@@ -226,11 +226,11 @@ impl ProxyPlan {
             .await
             {
                 Ok(socket) => {
-                    acta::info!("alternate route success: {}", entry.kind_name());
+                    tracing::info!("alternate route success: {}", entry.kind_name());
                     return Ok(socket);
                 }
                 Err(err) => {
-                    acta::info!("alternate route failed: {} => {:?}", entry.kind_name(), err);
+                    tracing::info!("alternate route failed: {} => {:?}", entry.kind_name(), err);
                     last_error = Some(err);
                 }
             }
@@ -247,7 +247,7 @@ impl ProxyPlan {
         let mut entries = Vec::new();
 
         if let Some(proxy_ip) = proxy_ip {
-            acta::info!(
+            tracing::info!(
                 "{} route override: ip relay configured",
                 if _from_request { "request" } else { "config" }
             );
@@ -291,7 +291,7 @@ impl ProxyPlan {
         }
 
         if let Some(proxy) = proxy {
-            acta::info!(
+            tracing::info!(
                 "{} route override: proxy relay configured",
                 if _from_request { "request" } else { "config" }
             );

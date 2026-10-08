@@ -334,7 +334,7 @@ impl UpstreamPool {
                                 .await
                                 .flatten();
                                 if let Some(ms) = ms {
-                                    acta::info!("DNS probe {host}:{port} -> {ms} ms");
+                                    tracing::info!("DNS probe {host}:{port} -> {ms} ms");
                                     latency = Some(ms);
                                     break;
                                 }

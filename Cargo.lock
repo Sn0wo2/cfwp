@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "acta"
-version = "0.4.0"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b466a5d5cceaaa314e35411ef8a160b913b26f5319bcf840631c2da16f981583"
+checksum = "b50659ea0ffce5e6fb33b4cfd85c7c4e483ea0996c69c61cb3b9e641e8337ed4"
 dependencies = [
  "acta-build",
  "ansi_colours",
@@ -16,6 +16,7 @@ dependencies = [
  "compact_str",
  "nerd-font-symbols",
  "owo-colors",
+ "serde_json",
  "smallvec",
  "supports-color",
  "thiserror",
@@ -28,9 +29,9 @@ dependencies = [
 
 [[package]]
 name = "acta-build"
-version = "0.4.0"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4d16926044b5d36a2609986a7e3f71eb9407c0600f5893dac9e64da7a879ba0"
+checksum = "3fab4d6244b1e6f68942876a096a27115b39fa97181aba1300efeeff7b22b450"
 dependencies = [
  "walkdir",
 ]
@@ -235,6 +236,7 @@ dependencies = [
  "smux-rs",
  "socksaddr",
  "tokio",
+ "tracing",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

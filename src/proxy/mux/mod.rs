@@ -235,7 +235,7 @@ pub(super) async fn handle(
             let (protocol, consumed) = match request.await {
                 Ok(request) => request,
                 Err(err) => {
-                    acta::error!("mux: session request failed: {err:?}");
+                    tracing::error!("mux: session request failed: {err:?}");
                     drop(websocket.close(Some(1008), Some("invalid mux session")));
                     return Ok(());
                 }
@@ -256,7 +256,7 @@ pub(super) async fn handle(
                     Some(Rc::new(yamux_rs::Windows::default())),
                 ),
                 other => {
-                    acta::warn!(
+                    tracing::warn!(
                         "mux: protocol {other} requested; h2mux is not supported, set \
                          `smux.protocol: smux` or `yamux` explicitly"
                     );
@@ -295,7 +295,7 @@ pub(super) async fn handle(
                 Ok(_) => {}
                 Err(err) => {
                     let err = Error::RustError(err.to_string());
-                    acta::error!("mux: tunnel reader failed: {err:?}");
+                    tracing::error!("mux: tunnel reader failed: {err:?}");
                     return LoopEvent::ReaderDone;
                 }
             }
@@ -305,11 +305,11 @@ pub(super) async fn handle(
             match next_chunk(&mut events, &mut decoder, &mut pending).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    acta::info!("mux: tunnel ended");
+                    tracing::info!("mux: tunnel ended");
                     return LoopEvent::ReaderDone;
                 }
                 Err(err) => {
-                    acta::error!("mux: tunnel reader failed: {err:?}");
+                    tracing::error!("mux: tunnel reader failed: {err:?}");
                     return LoopEvent::ReaderDone;
                 }
             }
@@ -331,7 +331,7 @@ pub(super) async fn handle(
                 Err(err) => Err(err),
             };
             if let Err(err) = result {
-                acta::error!("mux: tunnel writer failed: {err:?}");
+                tracing::error!("mux: tunnel writer failed: {err:?}");
                 return LoopEvent::WriterDone;
             }
         }
@@ -401,7 +401,7 @@ pub(super) async fn handle(
                 let shared: Shared = Rc::default();
                 match target {
                     Some(target) if target.is_routable() => {
-                        acta::info!("mux: stream {sid} -> {target}");
+                        tracing::info!("mux: stream {sid} -> {target}");
                         streams.insert(
                             sid,
                             Stream {
@@ -413,7 +413,7 @@ pub(super) async fn handle(
                         );
                     }
                     Some(_) => {
-                        acta::warn!("mux: stream {sid} has an invalid target");
+                        tracing::warn!("mux: stream {sid} has an invalid target");
                         reset_stream(&mut streams, sid);
                     }
                     None => {
@@ -441,7 +441,7 @@ pub(super) async fn handle(
                     false
                 });
                 if overflow {
-                    acta::warn!("mux: stream {sid} buffer overflow, resetting");
+                    tracing::warn!("mux: stream {sid} buffer overflow, resetting");
                     reset_stream(&mut streams, sid);
                 }
             }
@@ -464,7 +464,7 @@ pub(super) async fn handle(
                 }
             }
             LoopEvent::Raw(Event::Reject { sid }) => {
-                acta::info!("mux: stream {sid} requests udp, rejecting");
+                tracing::info!("mux: stream {sid} requests udp, rejecting");
                 reset_stream(&mut streams, sid);
             }
             LoopEvent::Raw(Event::Closed) | LoopEvent::ReaderDone => {
@@ -493,7 +493,7 @@ pub(super) async fn handle(
                 };
             }
             LoopEvent::ConnectFailed(sid, err) => {
-                acta::warn!("mux: stream {sid} connect failed: {err:?}");
+                tracing::warn!("mux: stream {sid} connect failed: {err:?}");
                 if mode == MuxMode::SingMux {
                     send_control(
                         &outbox,
@@ -507,11 +507,11 @@ pub(super) async fn handle(
             }
             LoopEvent::PumpDone(sid, result) => match result {
                 Ok((up, down)) => {
-                    acta::info!("mux: stream {sid} finished (up={up}, down={down})");
+                    tracing::info!("mux: stream {sid} finished (up={up}, down={down})");
                     remove_stream(&mut streams, sid);
                 }
                 Err(err) => {
-                    acta::warn!("mux: stream {sid} pump failed: {err}");
+                    tracing::warn!("mux: stream {sid} pump failed: {err}");
                     reset_stream(&mut streams, sid);
                 }
             },
@@ -590,7 +590,7 @@ pub(super) async fn handle(
         for (sid, outcome) in resolved {
             match outcome {
                 Ok((udp, target)) if udp || !target.is_routable() => {
-                    acta::warn!(
+                    tracing::warn!(
                         "mux: stream {sid} requests {}",
                         if udp { "udp" } else { "an invalid target" }
                     );
@@ -610,7 +610,7 @@ pub(super) async fn handle(
                     reset_stream(&mut streams, sid);
                 }
                 Ok((_, target)) => {
-                    acta::info!("mux: stream {sid} -> {target}");
+                    tracing::info!("mux: stream {sid} -> {target}");
                     if let Some(stream) = streams.get_mut(&sid) {
                         stream.phase = StreamPhase::Active {
                             fut: connect_future(sid, &target),
@@ -618,7 +618,7 @@ pub(super) async fn handle(
                     }
                 }
                 Err(err) => {
-                    acta::warn!("mux: stream {sid} request failed: {err:?}");
+                    tracing::warn!("mux: stream {sid} request failed: {err:?}");
                     if mode == MuxMode::SingMux {
                         send_control(
                             &outbox,

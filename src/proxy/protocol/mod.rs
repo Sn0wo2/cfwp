@@ -315,7 +315,7 @@ impl InitialRequest {
                         }
                         Ok(())
                     })?;
-                    acta::info!("protocol: shadowsocks selected");
+                    tracing::info!("protocol: shadowsocks selected");
                     let mut salt = vec![0; kind.salt_len()];
                     getrandom::fill(&mut salt).map_err(|err| {
                         Error::RustError(format!("Shadowsocks salt generation failed: {err}"))
@@ -460,7 +460,7 @@ impl InitialRequest {
                 || option & 0x01 == 0
                 || (option & 0x08 != 0 && option & 0x04 == 0)
             {
-                acta::error!("vmess: unsupported command, security, or options");
+                tracing::error!("vmess: unsupported command, security, or options");
                 return Err(Error::RustError("unsupported encrypted stream mode".into()));
             }
             let (hostname, port, index) = if mux_cool {
@@ -512,7 +512,7 @@ impl InitialRequest {
                 seen.insert(auth, time.saturating_add(vmess::CLOCK_SKEW));
                 Ok(())
             })?;
-            acta::info!("vmess: request header authenticated");
+            tracing::info!("vmess: request header authenticated");
             let response_key: [u8; 16] = Sha256::digest(key)
                 .get(..16)
                 .and_then(|bytes| bytes.try_into().ok())
@@ -581,7 +581,7 @@ impl InitialRequest {
                 .into_owned();
             break 'vmess Some(request);
         } {
-            acta::info!("protocol: vmess selected");
+            tracing::info!("protocol: vmess selected");
             return Ok(Some(request));
         }
 
@@ -591,7 +591,7 @@ impl InitialRequest {
                     .is_ok_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
         });
         if is_vless {
-            acta::info!("protocol: vless selected");
+            tracing::info!("protocol: vless selected");
             if chunk.len() < 19 {
                 return Ok(None);
             }
@@ -623,7 +623,7 @@ impl InitialRequest {
                 return Err(Error::RustError("unsupported route mode".into()));
             }
             if command == 3 {
-                acta::info!(
+                tracing::info!(
                     "protocol: vless mux.cool session (payload={}B)",
                     chunk.len() - cmd_index - 1
                 );
@@ -654,7 +654,7 @@ impl InitialRequest {
                 .get(address_start + addr_len..)
                 .ok_or_else(|| Error::RustError("invalid VLESS header".into()))?
                 .to_vec();
-            acta::info!(
+            tracing::info!(
                 "identity-header parsed: rev={} opt={} mode={} route={addr} datagram={} payload={}B",
                 version,
                 opt_len,
@@ -674,14 +674,14 @@ impl InitialRequest {
             .get(..16)
             .is_some_and(|auth| auth.iter().all(u8::is_ascii_hexdigit))
         {
-            acta::info!("protocol: trojan selected");
-            acta::info!("trojan: received header candidate ({} bytes)", chunk.len());
+            tracing::info!("protocol: trojan selected");
+            tracing::info!("trojan: received header candidate ({} bytes)", chunk.len());
             if chunk.len() < 60 {
-                acta::info!("trojan: waiting for header");
+                tracing::info!("trojan: waiting for header");
                 return Ok(None);
             }
             if chunk.get(56..58) != Some(b"\r\n") {
-                acta::error!("trojan: invalid authentication delimiter");
+                tracing::error!("trojan: invalid authentication delimiter");
                 return Err(Error::RustError("invalid request header".into()));
             }
             let provided = std::str::from_utf8(
@@ -693,10 +693,10 @@ impl InitialRequest {
             if provided != hex::encode(Sha224::digest(user_id.as_bytes()))
                 && provided != hex::encode(Sha224::digest(user_id.replace('-', "").as_bytes()))
             {
-                acta::error!("trojan: authentication failed");
+                tracing::error!("trojan: authentication failed");
                 return Err(Error::RustError("invalid access token".into()));
             }
-            acta::info!("trojan: authenticated");
+            tracing::info!("trojan: authenticated");
 
             let socks = chunk
                 .get(58..)
@@ -706,13 +706,13 @@ impl InitialRequest {
                 .copied()
                 .ok_or_else(|| Error::RustError("invalid request header".into()))?;
             if command != 1 {
-                acta::error!("trojan: unsupported command {command}");
+                tracing::error!("trojan: unsupported command {command}");
                 return Err(Error::RustError("unsupported stream mode".into()));
             }
             let (addr, address_end) = match SocksAddr::parse_socks(socks) {
                 Ok(parsed) => parsed,
                 Err(ParseError::Truncated) => {
-                    acta::info!("trojan: waiting for route header");
+                    tracing::info!("trojan: waiting for route header");
                     return Ok(None);
                 }
                 Err(ParseError::Invalid(message)) => {
@@ -723,18 +723,18 @@ impl InitialRequest {
                 .checked_add(2)
                 .ok_or_else(|| Error::RustError("invalid request header".into()))?;
             if socks.len() < delimiter_end {
-                acta::info!("trojan: waiting for route header");
+                tracing::info!("trojan: waiting for route header");
                 return Ok(None);
             }
             if socks.get(address_end..delimiter_end) != Some(b"\r\n") {
-                acta::error!("trojan: invalid route delimiter");
+                tracing::error!("trojan: invalid route delimiter");
                 return Err(Error::RustError("invalid frame delimiter".into()));
             }
             let payload = socks
                 .get(delimiter_end..)
                 .ok_or_else(|| Error::RustError("invalid request header".into()))?
                 .to_vec();
-            acta::info!(
+            tracing::info!(
                 "trojan: request parsed (addr={addr}, payload={} bytes)",
                 payload.len()
             );
@@ -749,7 +749,7 @@ impl InitialRequest {
         if chunk.len() < shadowsocks::MAX_PROBE_HEADER {
             return Ok(None);
         }
-        acta::info!("protocol: no matching request format");
+        tracing::info!("protocol: no matching request format");
         Err(Error::RustError("invalid request".into()))
     }
 }

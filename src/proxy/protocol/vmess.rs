@@ -20,7 +20,7 @@ thread_local! {
 }
 
 pub(super) fn invalid_at(stage: &str) -> Error {
-    acta::error!("vmess: {stage}");
+    tracing::error!("vmess: {stage}");
     Error::RustError("invalid encrypted request".into())
 }
 

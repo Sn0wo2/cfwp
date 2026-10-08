@@ -374,7 +374,7 @@ impl DnsService {
             .await
             {
                 Ok(cached) => response = cached,
-                Err(err) => acta::info!("DNS cache read failed: {err}"),
+                Err(err) => tracing::info!("DNS cache read failed: {err}"),
             }
         }
         let mut response = match response {
@@ -454,7 +454,7 @@ impl DnsService {
                     }
                     .await
                 {
-                    acta::info!("DNS cache write failed: {err}");
+                    tracing::info!("DNS cache write failed: {err}");
                 }
                 response
             }
