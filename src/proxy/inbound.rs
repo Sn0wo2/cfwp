@@ -24,12 +24,6 @@ pub(crate) async fn handle(
 ) -> Result<Response> {
     let request_url = req.url()?;
     let user_id = config.user_id.clone();
-    if request_url.path().strip_prefix('/') != Some(user_id.as_str())
-        && request_url.path().strip_prefix('/') != Some(user_id.replace('-', "").as_str())
-    {
-        tracing::error!("fetch: websocket path mismatch");
-        return Response::error("Not Found", 404);
-    }
 
     let mut plan = ProxyPlan {
         entries: ProxyPlan::collect_entries(

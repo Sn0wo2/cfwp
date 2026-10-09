@@ -236,6 +236,12 @@ impl Encoder {
 }
 
 impl InitialRequest {
+    fn parse_uuid_v4(user_id: &str) -> Option<Uuid> {
+        Uuid::parse_str(user_id)
+            .ok()
+            .filter(|uuid| uuid.get_version() == Some(uuid::Version::Random))
+    }
+
     #[cfg(feature = "dns")]
     pub(super) const fn is_dns_request(&self) -> bool {
         self.is_udp && self.port == 53
@@ -344,7 +350,7 @@ impl InitialRequest {
             if chunk.len() < 16 {
                 break 'vmess None;
             }
-            let Ok(uuid) = Uuid::parse_str(user_id) else {
+            let Some(uuid) = Self::parse_uuid_v4(user_id) else {
                 break 'vmess None;
             };
             let mut seed = uuid.as_bytes().to_vec();
@@ -587,8 +593,8 @@ impl InitialRequest {
 
         let is_vless = chunk.get(..17).is_some_and(|header| {
             header.first() == Some(&0)
-                && Uuid::parse_str(user_id)
-                    .is_ok_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
+                && Self::parse_uuid_v4(user_id)
+                    .is_some_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
         });
         if is_vless {
             tracing::info!("protocol: vless selected");

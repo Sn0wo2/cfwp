@@ -55,6 +55,7 @@ proxy = [
   "dep:web-sys",
   "dep:wasm-bindgen",
   "dep:wasm-bindgen-futures",
+  "dep:uuid",
   "dep:yamux-rs",
 ]
 dns = ["dep:domain", "dep:serde", "dep:serde_json"]
@@ -99,7 +100,7 @@ sha3 = { version = "0.12", optional = true }
 shake = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["io-util", "sync"] }
 tracing = "0.1"
-uuid = "1"
+uuid = { version = "1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-sys = { version = "0.3", features = [
