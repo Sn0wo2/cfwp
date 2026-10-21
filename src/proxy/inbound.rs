@@ -8,6 +8,7 @@ use worker::{Context, Request, Response, Result, WebSocketPair, WebsocketEvent};
 use super::outbound::ProxyPlan;
 use super::protocol::InitialRequest;
 use super::transport::{self, InboundStream, OutboundStream};
+use super::util::decode_message;
 
 #[allow(clippy::single_call_fn)]
 pub(crate) async fn handle(
@@ -70,7 +71,7 @@ pub(crate) async fn handle(
                 match events.next().await {
                     Some(event) => match event? {
                         WebsocketEvent::Message(message) => {
-                            if let Some(payload) = transport::decode_message(message) {
+                            if let Some(payload) = decode_message(message) {
                                 tracing::info!(
                                     "session: first websocket message ({} bytes)",
                                     payload.len()
@@ -110,7 +111,7 @@ pub(crate) async fn handle(
                     }
                     Ok(None) if initial.len() < MAX_INITIAL_HEADER => match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
-                            if let Some(bytes) = transport::decode_message(message) {
+                            if let Some(bytes) = decode_message(message) {
                                 tracing::info!("session: continued header ({} bytes)", bytes.len());
                                 let remaining = MAX_INITIAL_HEADER - initial.len();
                                 if bytes.len() > remaining {
@@ -187,8 +188,7 @@ pub(crate) async fn handle(
                 return Ok(());
             }
 
-            let udp_only = request.is_udp && !request.is_dns_request();
-            if udp_only {
+            if request.is_udp && !request.is_dns_request() {
                 tracing::info!("session: UDP request unsupported");
                 websocket.close(Some(1003), Some("udp unsupported"))?;
                 return Ok(());
@@ -236,7 +236,7 @@ pub(crate) async fn handle(
 
                     match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
-                            if let Some(bytes) = transport::decode_message(message) {
+                            if let Some(bytes) = decode_message(message) {
                                 pending.extend_from_slice(
                                     &request.codec.inbound.decode(&bytes).await?,
                                 );

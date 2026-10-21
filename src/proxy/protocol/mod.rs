@@ -18,8 +18,6 @@ use socksaddr::{ParseError, SocksAddr};
 use super::transport::{InboundStream, OutboundStream};
 use crate::{config::InboundConfig, proxy::webcrypto};
 
-const MAX_SEEN_SALTS: usize = 32 * 1024;
-
 thread_local! {
     static SEEN_SALTS: RefCell<LinkedHashSet<(usize, Vec<u8>)>> =
         RefCell::new(LinkedHashSet::new());
@@ -87,10 +85,9 @@ impl InboundStream for Decoder {
                             if let Some(masker) = &mut decoder.masker {
                                 masker.read(&mut mask);
                             }
-                            let length_end = pos + 2;
                             let Some(length_bytes) = decoder
                                 .pending
-                                .get(pos..length_end)
+                                .get(pos..pos + 2)
                                 .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
                             else {
                                 break 'decode Err(vmess::invalid_at("invalid body chunk length"));
@@ -121,7 +118,7 @@ impl InboundStream for Decoder {
                         };
                         let payload = match &decoder.cipher {
                             vmess::BodyCipher::Aes(key) => {
-                                webcrypto::aes_gcm_decrypt(key, &nonce, None, data)
+                                webcrypto::aes_gcm(key, &nonce, None, data, false)
                                     .await
                                     .map_err(|_| {
                                         vmess::invalid_at("AES body chunk authentication failed")
@@ -212,7 +209,7 @@ impl OutboundStream for Encoder {
                     let nonce = vmess::chunk_nonce(&encoder.iv, encoder.counter);
                     output.extend(match &encoder.cipher {
                         vmess::BodyCipher::Aes(key) => {
-                            webcrypto::aes_gcm_encrypt(key, &nonce, None, part)
+                            webcrypto::aes_gcm(key, &nonce, None, part, true)
                                 .await
                                 .map_err(|_| vmess::invalid_at("invalid encrypted request"))?
                         }
@@ -237,12 +234,6 @@ impl OutboundStream for Encoder {
 }
 
 impl InitialRequest {
-    fn parse_uuid_v4(user_id: &str) -> Option<Uuid> {
-        Uuid::parse_str(user_id)
-            .ok()
-            .filter(|uuid| uuid.get_version() == Some(uuid::Version::Random))
-    }
-
     #[allow(clippy::single_call_fn)]
     fn vmess_auth_id_matches(chunk: &[u8], uuid: &Uuid) -> bool {
         let Some(auth) = chunk
@@ -361,7 +352,7 @@ impl InitialRequest {
                         return Err(Error::RustError("replayed Shadowsocks salt".into()));
                     }
                     seen.insert(salt);
-                    if seen.len() > MAX_SEEN_SALTS {
+                    if seen.len() > 32 * 1024 {
                         seen.pop_front();
                     }
                     Ok(())
@@ -395,7 +386,9 @@ impl InitialRequest {
                 return None;
             };
             config.users.iter().find_map(|user| {
-                Self::parse_uuid_v4(&user.uuid)
+                Uuid::parse_str(&user.uuid)
+                    .ok()
+                    .filter(|uuid| uuid.get_version() == Some(uuid::Version::Random))
                     .filter(|uuid| Self::vmess_auth_id_matches(chunk, uuid))
             })
         });
@@ -652,7 +645,9 @@ impl InitialRequest {
                         return false;
                     };
                     config.users.iter().any(|user| {
-                        Self::parse_uuid_v4(&user.uuid)
+                        Uuid::parse_str(&user.uuid)
+                            .ok()
+                            .filter(|uuid| uuid.get_version() == Some(uuid::Version::Random))
                             .is_some_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
                     })
                 })
@@ -783,6 +778,9 @@ impl InitialRequest {
                 tracing::error!("trojan: unsupported command {command}");
                 return Err(Error::RustError("unsupported stream mode".into()));
             }
+            let socks = socks
+                .get(1..)
+                .ok_or_else(|| Error::RustError("invalid request header".into()))?;
             let (addr, address_end) = match SocksAddr::parse_socks(socks) {
                 Ok(parsed) => parsed,
                 Err(ParseError::Truncated) => {

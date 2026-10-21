@@ -58,7 +58,7 @@ impl Cipher {
                 Ok(pkt)
             }
             Self::Web { key, nonce, .. } => {
-                let packet = webcrypto::aes_gcm_encrypt(key, nonce, None, plaintext).await?;
+                let packet = webcrypto::aes_gcm(key, nonce, None, plaintext, true).await?;
                 increase_nonce(nonce);
                 Ok(packet)
             }
@@ -75,7 +75,7 @@ impl Cipher {
                 })
             }
             Self::Web { key, nonce, .. } => {
-                let plaintext = webcrypto::aes_gcm_decrypt(key, nonce, None, packet)
+                let plaintext = webcrypto::aes_gcm(key, nonce, None, packet, false)
                     .await
                     .ok();
                 increase_nonce(nonce);
@@ -123,7 +123,7 @@ impl ChunkDecoder {
                 let Some(size_bytes) = self.cipher.decrypt(length_packet).await else {
                     return Err(Error::RustError("invalid Shadowsocks chunk length".into()));
                 };
-                let size_bytes: [u8; 2] = size_bytes
+                let size_bytes = size_bytes
                     .as_slice()
                     .try_into()
                     .map_err(|_| Error::RustError("invalid Shadowsocks chunk length".into()))?;

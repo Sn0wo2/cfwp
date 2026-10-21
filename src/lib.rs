@@ -12,9 +12,10 @@ use worker::*;
 
 #[allow(clippy::single_call_fn)]
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    static ACTA_GUARD: std::sync::OnceLock<Option<acta::TracingGuard>> = std::sync::OnceLock::new();
-    let _ = ACTA_GUARD.get_or_init(|| {
+async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    static ACTA_GUARD: std::sync::OnceLock<std::result::Result<acta::TracingGuard, String>> =
+        std::sync::OnceLock::new();
+    let logging = ACTA_GUARD.get_or_init(|| {
         acta::init(
             acta::Config::builder()
                 .with_writers([acta::Writer::stdout()
@@ -27,24 +28,31 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     .with_color_depth(acta::ColorDepth::TrueColor)])
                 .build(),
         )
-        .ok()
+        .map_err(|err| format!("Logging initialization failed: {err}"))
     });
+    if let Err(err) = logging {
+        return Err(Error::RustError(err.clone()));
+    }
 
     let url = req.url()?;
-    let config = config::Config::from_env(&env, &url.origin().ascii_serialization())?;
-    let websocket = req
+    tracing::info!("fetch: {} {}", req.method(), url.path());
+    let config =
+        config::Config::from_env(&env, &url.origin().ascii_serialization()).map_err(|err| {
+            tracing::error!("Configuration failed: {err}");
+            err
+        })?;
+    if req
         .headers()
         .get("Upgrade")
         .ok()
         .flatten()
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    if websocket {
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
         tracing::info!("fetch: websocket upgrade requested");
         return proxy::handle(&config, req, _ctx).await;
     }
 
     if url.path() == "/dns-query" {
-        let mut req = req;
         let limit = config.dns.config.max_message_bytes;
         let payload = match req.method() {
             Method::Get => {
@@ -65,10 +73,16 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             }
             Method::Post => {
-                let content_type = req.headers().get("content-type")?.unwrap_or_default();
-                if !content_type.split(';').next().is_some_and(|value| {
-                    value.trim().eq_ignore_ascii_case("application/dns-message")
-                }) {
+                if !req
+                    .headers()
+                    .get("content-type")?
+                    .unwrap_or_default()
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| {
+                        value.trim().eq_ignore_ascii_case("application/dns-message")
+                    })
+                {
                     return error("Expected application/dns-message", 415);
                 }
                 if let Some(length) = req.headers().get("content-length")? {
@@ -90,11 +104,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Ok(response);
             }
         };
-        let client_ip = req
-            .headers()
-            .get("CF-Connecting-IP")?
-            .and_then(|value| value.parse().ok());
-        let prepared = match config.dns.prepare(&payload, client_ip) {
+        let prepared = match config.dns.prepare(
+            &payload,
+            req.headers()
+                .get("CF-Connecting-IP")?
+                .and_then(|value| value.parse().ok()),
+        ) {
             Ok(prepared) => prepared,
             Err(DnsError::TooLarge) => return error("Invalid or oversized DNS query", 413),
             Err(_) => return error("Invalid or oversized DNS query", 400),

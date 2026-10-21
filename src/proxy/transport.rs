@@ -8,6 +8,7 @@ use worker::{Error, Result, Socket, WebSocket, WebsocketEvent};
 
 use super::outbound::ProxyPlan;
 use super::protocol::{Codec, Decoder, Encoder, InitialRequest};
+use super::util::decode_message;
 use crate::dns::DnsService;
 
 pub(super) trait InboundStream {
@@ -113,15 +114,4 @@ pub(super) async fn route(
     result?;
     websocket.close(None, None::<String>)?;
     Ok(())
-}
-
-pub(super) fn decode_message(message: worker::MessageEvent) -> Option<Vec<u8>> {
-    message
-        .bytes()
-        .filter(|bytes| !bytes.is_empty())
-        .or_else(|| {
-            message
-                .text()
-                .and_then(|text| (!text.is_empty()).then_some(text.into_bytes()))
-        })
 }

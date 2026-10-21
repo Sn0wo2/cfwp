@@ -53,10 +53,9 @@ fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
 }
 
 pub(super) fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
-    let digest = kdf(key, path);
     let mut result = [0_u8; 16];
-    for (destination, source) in result.iter_mut().zip(digest.iter()) {
-        *destination = *source;
+    for (destination, source) in result.iter_mut().zip(kdf(key, path)) {
+        *destination = source;
     }
     result
 }
@@ -69,21 +68,20 @@ pub(super) async fn open(
     stage: &str,
 ) -> Result<Vec<u8>> {
     let cipher = webcrypto::import_aes_gcm_key(&key).await?;
-    webcrypto::aes_gcm_decrypt(&cipher, &nonce, Some(aad), data)
+    webcrypto::aes_gcm(&cipher, &nonce, Some(aad), data, false)
         .await
         .map_err(|_| invalid_at(stage))
 }
 
 pub(super) async fn seal(key: [u8; 16], nonce: [u8; 12], data: &[u8]) -> Result<Vec<u8>> {
     let cipher = webcrypto::import_aes_gcm_key(&key).await?;
-    webcrypto::aes_gcm_encrypt(&cipher, &nonce, None, data).await
+    webcrypto::aes_gcm(&cipher, &nonce, None, data, true).await
 }
 
 pub(super) fn nonce(key: &[u8], path: &[&[u8]]) -> [u8; 12] {
-    let digest = kdf(key, path);
     let mut result = [0_u8; 12];
-    for (destination, source) in result.iter_mut().zip(digest.iter()) {
-        *destination = *source;
+    for (destination, source) in result.iter_mut().zip(kdf(key, path)) {
+        *destination = source;
     }
     result
 }
@@ -111,11 +109,13 @@ pub(super) fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
 }
 
 pub(super) fn masker(iv: &[u8; 16], options: u8) -> Option<Box<dyn XofReader>> {
-    (options & 0x04 != 0).then(|| {
+    if options & 0x04 == 0 {
+        return None;
+    }
+    Some({
         let mut shake = Shake128::default();
         shake.update(iv);
-        let reader: Box<dyn XofReader> = Box::new(shake.finalize_xof());
-        reader
+        Box::new(shake.finalize_xof())
     })
 }
 

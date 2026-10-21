@@ -53,10 +53,10 @@ struct ProxyCredential {
 impl ProxyPlan {
     #[allow(clippy::single_call_fn, clippy::literal_string_with_formatting_args)]
     pub(super) fn from_config(config: &Config, colo: Option<&str>) -> Result<Self> {
-        let outbound = config
+        let outbound = match config
             .final_outbound()
-            .ok_or_else(|| Error::RustError("route.final references an unknown outbound".into()))?;
-        let outbound = match outbound {
+            .ok_or_else(|| Error::RustError("route.final references an unknown outbound".into()))?
+        {
             OutboundConfig::Direct(_) => ProxyEntry::Direct,
             OutboundConfig::Socks(config) => {
                 let credential = ProxyCredential {
@@ -90,15 +90,14 @@ impl ProxyPlan {
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                let addresses = if servers.is_empty() {
+                ProxyEntry::Tproxy(if servers.is_empty() {
                     Vec::new()
                 } else {
                     parse_tproxy_servers(&servers, config.server_port)?
                         .into_iter()
                         .map(|(host, port)| ProxyAddress { host, port })
                         .collect()
-                };
-                ProxyEntry::Tproxy(addresses)
+                })
             }
         };
         Ok(Self { outbound })
@@ -131,8 +130,44 @@ impl ProxyPlan {
         dns: &DnsService,
     ) -> Result<Socket> {
         match &self.outbound {
-            ProxyEntry::Direct => connect_target(hostname, port, payload, dns).await,
-            ProxyEntry::Tproxy(addresses) => connect_tproxy(addresses, payload, dns).await,
+            ProxyEntry::Direct => {
+                let mut socket = connect_tcp(dns, hostname, port).await?;
+                match with_timeout(CONNECT_TIMEOUT_MS, async {
+                    socket.opened().await?;
+                    if !payload.is_empty() {
+                        socket.write_all(payload).await?;
+                        socket.flush().await?;
+                    }
+                    Ok(())
+                })
+                .await
+                {
+                    Some(Ok(())) => Ok(socket),
+                    Some(Err(err)) => {
+                        drop(socket.close().await);
+                        Err(err)
+                    }
+                    None => {
+                        drop(socket.close().await);
+                        Err(Error::RustError(format!(
+                            "target connection timed out after {CONNECT_TIMEOUT_MS} ms"
+                        )))
+                    }
+                }
+            }
+            ProxyEntry::Tproxy(addresses) => {
+                let candidates = resolve_tproxy_candidates(addresses, dns).await;
+                let mut last_error = None;
+                for address in &candidates {
+                    match connect_tproxy_address(address, payload, dns).await {
+                        Ok(socket) => return Ok(socket),
+                        Err(err) => last_error = Some(err),
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    Error::RustError("tproxy has no usable server candidates".into())
+                }))
+            }
             ProxyEntry::Socks4(proxy) | ProxyEntry::Socks5(proxy) | ProxyEntry::Http(proxy) => {
                 self.connect_via_proxy(proxy, hostname, port, payload, dns)
                     .await
@@ -141,7 +176,13 @@ impl ProxyPlan {
     }
 
     pub(super) const fn kind_name(&self) -> &'static str {
-        self.outbound.kind_name()
+        match &self.outbound {
+            ProxyEntry::Direct => "direct",
+            ProxyEntry::Tproxy(_) => "tproxy",
+            ProxyEntry::Socks4(_) => "socks4",
+            ProxyEntry::Socks5(_) => "socks5",
+            ProxyEntry::Http(_) => "http",
+        }
     }
 
     async fn connect_via_proxy(
@@ -159,7 +200,7 @@ impl ProxyPlan {
             .next()
             .ok_or_else(|| Error::RustError("DNS returned no usable addresses".into()))?;
         let mut socket = connect_tcp(dns, &proxy.host, proxy.port).await?;
-        let result = with_timeout(CONNECT_TIMEOUT_MS, async {
+        match with_timeout(CONNECT_TIMEOUT_MS, async {
             socket.opened().await?;
             match &self.outbound {
                 ProxyEntry::Socks5(_) => {
@@ -233,7 +274,10 @@ impl ProxyPlan {
                     socket
                         .read_exact(&mut vec![0_u8; address_len + 2])
                         .await?;
-                    write_payload(&mut socket, payload).await?;
+                    if !payload.is_empty() {
+                        socket.write_all(payload).await?;
+                        socket.flush().await?;
+                    }
                 }
                 ProxyEntry::Socks4(_) => {
                     let IpAddr::V4(ipv4) = target_address else {
@@ -258,7 +302,10 @@ impl ProxyPlan {
                             response[1]
                         )));
                     }
-                    write_payload(&mut socket, payload).await?;
+                    if !payload.is_empty() {
+                        socket.write_all(payload).await?;
+                        socket.flush().await?;
+                    }
                 }
                 ProxyEntry::Http(_) => {
                     let authority = if target_address.is_ipv6() {
@@ -298,7 +345,10 @@ impl ProxyPlan {
                     {
                         return Err(Error::RustError("invalid HTTP proxy handshake".into()));
                     }
-                    write_payload(&mut socket, payload).await?;
+                    if !payload.is_empty() {
+                        socket.write_all(payload).await?;
+                        socket.flush().await?;
+                    }
                 }
                 ProxyEntry::Direct | ProxyEntry::Tproxy(_) => {
                     return Err(Error::RustError("invalid proxy plan".into()));
@@ -306,8 +356,7 @@ impl ProxyPlan {
             }
             Ok(())
         })
-        .await;
-        match result {
+        .await {
             Some(Ok(())) => Ok(socket),
             Some(Err(err)) => {
                 drop(socket.close().await);
@@ -321,64 +370,6 @@ impl ProxyPlan {
             }
         }
     }
-}
-
-impl ProxyEntry {
-    const fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Tproxy(_) => "tproxy",
-            Self::Socks4(_) => "socks4",
-            Self::Socks5(_) => "socks5",
-            Self::Http(_) => "http",
-        }
-    }
-}
-
-#[allow(clippy::single_call_fn)]
-pub(super) async fn connect_target(
-    hostname: &str,
-    port: u16,
-    payload: &[u8],
-    dns: &DnsService,
-) -> Result<Socket> {
-    let mut socket = connect_tcp(dns, hostname, port).await?;
-    match with_timeout(CONNECT_TIMEOUT_MS, async {
-        socket.opened().await?;
-        write_payload(&mut socket, payload).await
-    })
-    .await
-    {
-        Some(Ok(())) => Ok(socket),
-        Some(Err(err)) => {
-            drop(socket.close().await);
-            Err(err)
-        }
-        None => {
-            drop(socket.close().await);
-            Err(Error::RustError(format!(
-                "target connection timed out after {CONNECT_TIMEOUT_MS} ms"
-            )))
-        }
-    }
-}
-
-#[allow(clippy::single_call_fn)]
-async fn connect_tproxy(
-    addresses: &[ProxyAddress],
-    payload: &[u8],
-    dns: &DnsService,
-) -> Result<Socket> {
-    let candidates = resolve_tproxy_candidates(addresses, dns).await;
-    let mut last_error = None;
-    for address in &candidates {
-        match connect_tproxy_address(address, payload, dns).await {
-            Ok(socket) => return Ok(socket),
-            Err(err) => last_error = Some(err),
-        }
-    }
-    Err(last_error
-        .unwrap_or_else(|| Error::RustError("tproxy has no usable server candidates".into())))
 }
 
 #[allow(clippy::single_call_fn)]
@@ -467,7 +458,11 @@ async fn connect_tproxy_address(
     let mut socket = connect_tcp(dns, &address.host, address.port).await?;
     match with_timeout(CONNECT_TIMEOUT_MS, async {
         socket.opened().await?;
-        write_payload(&mut socket, payload).await
+        if !payload.is_empty() {
+            socket.write_all(payload).await?;
+            socket.flush().await?;
+        }
+        Ok(())
     })
     .await
     {
@@ -483,13 +478,4 @@ async fn connect_tproxy_address(
             )))
         }
     }
-}
-
-async fn write_payload(socket: &mut Socket, payload: &[u8]) -> Result<()> {
-    if payload.is_empty() {
-        return Ok(());
-    }
-    socket.write_all(payload).await?;
-    socket.flush().await?;
-    Ok(())
 }
