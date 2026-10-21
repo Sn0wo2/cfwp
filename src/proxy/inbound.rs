@@ -25,7 +25,8 @@ pub(crate) async fn handle(
     if inbounds.is_empty() {
         return Response::error("Not Found", 404);
     }
-    let plan = ProxyPlan::from_config(config)?;
+    let colo = req.cf().map(|cf| cf.colo().to_lowercase());
+    let plan = ProxyPlan::from_config(config, colo.as_deref())?;
     let early_data = req
         .headers()
         .get("sec-websocket-protocol")

@@ -157,7 +157,10 @@ impl Settings {
                     }
                 }
                 OutboundConfig::Tproxy(config) => {
-                    validate_server(&config.server, config.server_port)?;
+                    parse_tproxy_servers(
+                        &config.server.replace("{colo}", "sfo"),
+                        config.server_port,
+                    )?;
                 }
             }
         }
@@ -242,6 +245,60 @@ fn validate_server(server: &str, port: u16) -> Result<()> {
         return Err(config_error("outbound server is invalid"));
     }
     Ok(())
+}
+
+const MAX_TPROXY_SERVERS: usize = 16;
+
+pub(crate) fn parse_tproxy_servers(server: &str, default_port: u16) -> Result<Vec<(String, u16)>> {
+    if server.trim().is_empty() || default_port == 0 {
+        return Err(config_error("tproxy server addresses are invalid"));
+    }
+
+    let mut addresses = Vec::new();
+    for candidate in server.split(',') {
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate.contains(['/', '?', '#', '@', '{', '}']) {
+            return Err(config_error("tproxy server addresses are invalid"));
+        }
+
+        let (host, port) = if let Ok(address) = candidate.parse::<std::net::Ipv6Addr>() {
+            (address.to_string(), default_port)
+        } else {
+            let url = Url::parse(&format!("tcp://{candidate}"))
+                .map_err(|_| config_error("tproxy server address is invalid"))?;
+            let host = url
+                .host_str()
+                .and_then(|host| {
+                    host.strip_prefix('[')
+                        .and_then(|value| value.strip_suffix(']'))
+                        .or(Some(host))
+                })
+                .ok_or_else(|| config_error("tproxy server address is invalid"))?;
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(config_error("tproxy server address is invalid"));
+            }
+            (host.to_string(), url.port().unwrap_or(default_port))
+        };
+
+        if port == 0 {
+            return Err(config_error("tproxy server port is invalid"));
+        }
+        addresses.push((host, port));
+        if addresses.len() > MAX_TPROXY_SERVERS {
+            return Err(config_error("too many tproxy server addresses"));
+        }
+    }
+
+    Ok(addresses)
+}
+
+const fn default_tproxy_server_port() -> u16 {
+    443
 }
 
 fn config_error(message: &str) -> Error {
@@ -452,5 +509,6 @@ pub(crate) struct HttpOutbound {
 pub(crate) struct TproxyOutbound {
     pub(crate) tag: String,
     pub(crate) server: String,
+    #[serde(default = "default_tproxy_server_port")]
     pub(crate) server_port: u16,
 }

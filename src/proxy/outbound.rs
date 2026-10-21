@@ -6,9 +6,11 @@ use worker::{Error, Result, Socket};
 
 use super::protocol::InitialRequest;
 use super::util::CONNECT_TIMEOUT_MS;
-use crate::config::{Config, OutboundConfig};
+use crate::config::{Config, OutboundConfig, parse_tproxy_servers};
 use crate::dns::DnsService;
 use crate::util::with_timeout;
+
+const MAX_PROXY_CANDIDATES: usize = 16;
 
 pub(super) async fn connect_tcp(dns: &DnsService, hostname: &str, port: u16) -> Result<Socket> {
     let address = dns
@@ -28,13 +30,13 @@ pub(super) struct ProxyPlan {
 #[derive(Clone)]
 enum ProxyEntry {
     Direct,
-    Tproxy(ProxyAddress),
+    Tproxy(Vec<ProxyAddress>),
     Socks4(ProxyCredential),
     Socks5(ProxyCredential),
     Http(ProxyCredential),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ProxyAddress {
     host: String,
     port: u16,
@@ -49,8 +51,8 @@ struct ProxyCredential {
 }
 
 impl ProxyPlan {
-    #[allow(clippy::single_call_fn)]
-    pub(super) fn from_config(config: &Config) -> Result<Self> {
+    #[allow(clippy::single_call_fn, clippy::literal_string_with_formatting_args)]
+    pub(super) fn from_config(config: &Config, colo: Option<&str>) -> Result<Self> {
         let outbound = config
             .final_outbound()
             .ok_or_else(|| Error::RustError("route.final references an unknown outbound".into()))?;
@@ -75,10 +77,29 @@ impl ProxyPlan {
                 username: config.username.clone(),
                 password: config.password.clone(),
             }),
-            OutboundConfig::Tproxy(config) => ProxyEntry::Tproxy(ProxyAddress {
-                host: config.server.clone(),
-                port: config.server_port,
-            }),
+            OutboundConfig::Tproxy(config) => {
+                let servers = config
+                    .server
+                    .split(',')
+                    .filter_map(|server| {
+                        if server.contains("{colo}") {
+                            colo.map(|colo| server.replace("{colo}", colo))
+                        } else {
+                            Some(server.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let addresses = if servers.is_empty() {
+                    Vec::new()
+                } else {
+                    parse_tproxy_servers(&servers, config.server_port)?
+                        .into_iter()
+                        .map(|(host, port)| ProxyAddress { host, port })
+                        .collect()
+                };
+                ProxyEntry::Tproxy(addresses)
+            }
         };
         Ok(Self { outbound })
     }
@@ -111,7 +132,7 @@ impl ProxyPlan {
     ) -> Result<Socket> {
         match &self.outbound {
             ProxyEntry::Direct => connect_target(hostname, port, payload, dns).await,
-            ProxyEntry::Tproxy(address) => connect_tproxy(address, payload, dns).await,
+            ProxyEntry::Tproxy(addresses) => connect_tproxy(addresses, payload, dns).await,
             ProxyEntry::Socks4(proxy) | ProxyEntry::Socks5(proxy) | ProxyEntry::Http(proxy) => {
                 self.connect_via_proxy(proxy, hostname, port, payload, dns)
                     .await
@@ -344,6 +365,101 @@ pub(super) async fn connect_target(
 
 #[allow(clippy::single_call_fn)]
 async fn connect_tproxy(
+    addresses: &[ProxyAddress],
+    payload: &[u8],
+    dns: &DnsService,
+) -> Result<Socket> {
+    let candidates = resolve_tproxy_candidates(addresses, dns).await;
+    let mut last_error = None;
+    for address in &candidates {
+        match connect_tproxy_address(address, payload, dns).await {
+            Ok(socket) => return Ok(socket),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| Error::RustError("tproxy has no usable server candidates".into())))
+}
+
+#[allow(clippy::single_call_fn)]
+async fn resolve_tproxy_candidates(
+    addresses: &[ProxyAddress],
+    dns: &DnsService,
+) -> Vec<ProxyAddress> {
+    let mut candidates = Vec::new();
+    let mut fallbacks = Vec::new();
+    for address in addresses {
+        if candidates.len() == MAX_PROXY_CANDIDATES {
+            break;
+        }
+        if address.host.parse::<IpAddr>().is_ok() {
+            if !fallbacks.contains(address) {
+                fallbacks.push(address.clone());
+            }
+            continue;
+        }
+
+        if let Ok(records) = dns.resolve_txt(&address.host).await {
+            for record in records {
+                if candidates.len() == MAX_PROXY_CANDIDATES {
+                    break;
+                }
+                let Ok(targets) = parse_tproxy_servers(&record, address.port) else {
+                    continue;
+                };
+                for (host, port) in targets {
+                    if candidates.len() == MAX_PROXY_CANDIDATES {
+                        break;
+                    }
+                    add_tproxy_candidates(&host, port, dns, &mut candidates).await;
+                }
+            }
+        }
+        if candidates.len() == MAX_PROXY_CANDIDATES {
+            break;
+        }
+        add_tproxy_candidates(&address.host, address.port, dns, &mut fallbacks).await;
+    }
+
+    for fallback in fallbacks {
+        if candidates.len() == MAX_PROXY_CANDIDATES {
+            break;
+        }
+        if !candidates.contains(&fallback) {
+            candidates.push(fallback);
+        }
+    }
+
+    candidates
+}
+
+async fn add_tproxy_candidates(
+    hostname: &str,
+    port: u16,
+    dns: &DnsService,
+    candidates: &mut Vec<ProxyAddress>,
+) {
+    if candidates.len() >= MAX_PROXY_CANDIDATES {
+        return;
+    }
+    if let Ok(addresses) = dns.resolve(hostname).await {
+        for address in addresses {
+            let candidate = ProxyAddress {
+                host: address.to_string(),
+                port,
+            };
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+                if candidates.len() == MAX_PROXY_CANDIDATES {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::single_call_fn)]
+async fn connect_tproxy_address(
     address: &ProxyAddress,
     payload: &[u8],
     dns: &DnsService,
