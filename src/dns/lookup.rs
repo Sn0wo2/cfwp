@@ -6,14 +6,12 @@ use worker::Error;
 
 use super::{DnsError, DnsResult, DnsService, config::AddressFamily};
 
-const MAX_TXT_RECORDS: usize = 16;
-
 #[allow(clippy::multiple_inherent_impl)]
 impl DnsService {
     async fn query(&self, hostname: &str, qtype: Rtype) -> DnsResult<Option<Message<Vec<u8>>>> {
         let name = Name::vec_from_str(hostname)
             .map_err(|_| Error::RustError("invalid DNS query name".into()))?;
-        let mut id = [0_u8; 2];
+        let mut id = [0; 2];
         getrandom::fill(&mut id)
             .map_err(|err| Error::RustError(format!("DNS query ID generation failed: {err}")))?;
         let mut builder = MessageBuilder::new_vec();
@@ -63,7 +61,7 @@ impl DnsService {
             }
             if !value.is_empty() {
                 records.push(value);
-                if records.len() == MAX_TXT_RECORDS {
+                if records.len() == 16 {
                     break;
                 }
             }
@@ -81,9 +79,8 @@ impl DnsService {
         let qtypes: &[Rtype] = match self.config.address_family {
             AddressFamily::OnlyV4 => &[Rtype::A],
             AddressFamily::OnlyV6 => &[Rtype::AAAA],
-            AddressFamily::None | AddressFamily::PerfV4 | AddressFamily::PerfV6 => {
-                &[Rtype::A, Rtype::AAAA]
-            }
+            AddressFamily::PerfV6 => &[Rtype::AAAA, Rtype::A],
+            AddressFamily::None | AddressFamily::PerfV4 => &[Rtype::A, Rtype::AAAA],
         };
         for &qtype in qtypes {
             let message = match self.query(hostname, qtype).await {
@@ -116,6 +113,14 @@ impl DnsService {
                 {
                     addresses.push(address);
                 }
+            }
+            if !addresses.is_empty()
+                && matches!(
+                    self.config.address_family,
+                    AddressFamily::PerfV4 | AddressFamily::PerfV6
+                )
+            {
+                break;
             }
         }
 

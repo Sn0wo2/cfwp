@@ -12,7 +12,6 @@ use worker::{Cache, Delay, Error, Headers, Response, Result};
 
 use super::{DnsError, DnsResult, DnsService, config::AddressFamily, util::read_body};
 
-const DNS_MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 const DEFAULT_UDP_PAYLOAD_SIZE: u16 = 1232;
 const EDNS_OPT_RTYPE: u16 = 41;
 const EDNS_OPTION_ECS: u16 = 8;
@@ -72,13 +71,13 @@ impl DnsService {
 
         let parsed = parse_message(payload)?;
         if parsed.qr {
-            return Err(wire_error("expected a DNS query").into());
+            return Err(Error::RustError("expected a DNS query".into()).into());
         }
         if parsed.opcode != Opcode::QUERY {
-            return Err(wire_error("only standard DNS queries are supported").into());
+            return Err(Error::RustError("only standard DNS queries are supported".into()).into());
         }
         if parsed.question_count == 0 {
-            return Err(wire_error("DNS query has no question").into());
+            return Err(Error::RustError("DNS query has no question".into()).into());
         }
 
         let policy = self.config.address_family;
@@ -89,14 +88,14 @@ impl DnsService {
         };
         if blocked {
             if parsed.question_count != 1 {
-                return Err(wire_error(
-                    "address-family filtering requires a single-question DNS query",
+                return Err(Error::RustError(
+                    "address-family filtering requires a single-question DNS query".into(),
                 )
                 .into());
             }
             if parsed.signed {
-                return Err(wire_error(
-                    "cannot synthesize an address-family response for a signed DNS query",
+                return Err(Error::RustError(
+                    "cannot synthesize an address-family response for a signed DNS query".into(),
                 )
                 .into());
             }
@@ -119,14 +118,14 @@ impl DnsService {
         };
         if preferred_type.is_some() {
             if parsed.question_count != 1 {
-                return Err(wire_error(
-                    "address-family preference requires a single-question DNS query",
+                return Err(Error::RustError(
+                    "address-family preference requires a single-question DNS query".into(),
                 )
                 .into());
             }
             if parsed.signed {
-                return Err(wire_error(
-                    "cannot rewrite a signed DNS query for address-family preference",
+                return Err(Error::RustError(
+                    "cannot rewrite a signed DNS query for address-family preference".into(),
                 )
                 .into());
             }
@@ -151,12 +150,12 @@ impl DnsService {
             let mut data = Vec::with_capacity(usize::from(subnet.compose_len()));
             subnet
                 .compose_option(&mut data)
-                .map_err(|_| wire_error("failed to compose EDNS client subnet"))?;
+                .map_err(|_| Error::RustError("failed to compose EDNS client subnet".into()))?;
             let mut option = Vec::with_capacity(4 + data.len());
             option.extend_from_slice(&EDNS_OPTION_ECS.to_be_bytes());
             option.extend_from_slice(
                 &u16::try_from(data.len())
-                    .map_err(|_| wire_error("EDNS client subnet is too large"))?
+                    .map_err(|_| Error::RustError("EDNS client subnet is too large".into()))?
                     .to_be_bytes(),
             );
             option.extend_from_slice(&data);
@@ -169,14 +168,16 @@ impl DnsService {
                         || bytes
                             .len()
                             .checked_add(option.len())
-                            .is_none_or(|len| len > DNS_MAX_MESSAGE_LEN)
+                            .is_none_or(|len| len > u16::MAX as usize)
                     {
                         cacheable = false;
                     } else if let Ok(new_rdlen) = u16::try_from(new_rdlen) {
                         bytes.extend_from_slice(&option);
                         bytes
                             .get_mut(opt.rdlen_offset..opt.rdlen_offset + 2)
-                            .ok_or_else(|| wire_error("EDNS resource-data length out of range"))?
+                            .ok_or_else(|| {
+                                Error::RustError("EDNS resource-data length out of range".into())
+                            })?
                             .copy_from_slice(&new_rdlen.to_be_bytes());
                         injected = true;
                     } else {
@@ -190,12 +191,14 @@ impl DnsService {
                     .get(10..12)
                     .and_then(|bytes| bytes.try_into().ok())
                     .map(u16::from_be_bytes)
-                    .ok_or_else(|| wire_error("DNS additional-record count out of range"))?;
+                    .ok_or_else(|| {
+                        Error::RustError("DNS additional-record count out of range".into())
+                    })?;
                 if arcount == u16::MAX
                     || bytes
                         .len()
                         .checked_add(11 + option.len())
-                        .is_none_or(|new_len| new_len > DNS_MAX_MESSAGE_LEN)
+                        .is_none_or(|new_len| new_len > u16::MAX as usize)
                     || option.len() > usize::from(u16::MAX)
                 {
                     cacheable = false;
@@ -208,7 +211,9 @@ impl DnsService {
                     bytes.extend_from_slice(&option);
                     bytes
                         .get_mut(10..12)
-                        .ok_or_else(|| wire_error("DNS additional-record count out of range"))?
+                        .ok_or_else(|| {
+                            Error::RustError("DNS additional-record count out of range".into())
+                        })?
                         .copy_from_slice(&(arcount + 1).to_be_bytes());
                     injected = true;
                 } else {
@@ -246,7 +251,7 @@ impl DnsService {
         if let Some(preferred_type) = preferred_type {
             let offset = prepared
                 .question_type_offset
-                .ok_or_else(|| wire_error("missing DNS question type offset"))?;
+                .ok_or_else(|| Error::RustError("missing DNS question type offset".into()))?;
             let mut probe_bytes = prepared.bytes.clone();
             write_u16(&mut probe_bytes, offset, u16::from(preferred_type))?;
             let mut probe_original = prepared.original.clone();
@@ -324,7 +329,7 @@ impl DnsService {
                 let query = prepared
                     .bytes
                     .get(2..)
-                    .ok_or_else(|| wire_error("DNS query header out of range"))?;
+                    .ok_or_else(|| Error::RustError("DNS query header out of range".into()))?;
                 Ok::<_, Error>(format!(
                     "{}{}",
                     cache.prefix,
@@ -361,11 +366,11 @@ impl DnsService {
                 }
                 let response_id = bytes
                     .get_mut(..2)
-                    .ok_or_else(|| wire_error("DNS response ID out of range"))?;
+                    .ok_or_else(|| Error::RustError("DNS response ID out of range".into()))?;
                 let query_id = prepared
                     .bytes
                     .get(..2)
-                    .ok_or_else(|| wire_error("DNS query ID out of range"))?;
+                    .ok_or_else(|| Error::RustError("DNS query ID out of range".into()))?;
                 response_id.copy_from_slice(query_id);
                 validate_response(&prepared.bytes, &bytes)?;
                 age(&mut bytes, elapsed)?;
@@ -480,17 +485,18 @@ impl DnsService {
                         write_u16(
                             &mut response,
                             opt.rdlen_offset,
-                            opt.rdlen
-                                .checked_sub(removed)
-                                .ok_or_else(|| wire_error("invalid ECS option length"))?
-                                as u16,
+                            opt.rdlen.checked_sub(removed).ok_or_else(|| {
+                                Error::RustError("invalid ECS option length".into())
+                            })? as u16,
                         )?;
                     } else {
                         for (start, end) in ranges {
                             write_u16(&mut response, start, EDNS_OPTION_PADDING)?;
                             response
                                 .get_mut(start + 4..end)
-                                .ok_or_else(|| wire_error("EDNS padding range out of bounds"))?
+                                .ok_or_else(|| {
+                                    Error::RustError("EDNS padding range out of bounds".into())
+                                })?
                                 .fill(0);
                         }
                     }
@@ -503,17 +509,19 @@ impl DnsService {
 }
 
 pub(super) fn validate_response(query: &[u8], response: &[u8]) -> Result<()> {
-    let query_message =
-        Message::from_slice(query).map_err(|_| wire_error("malformed DNS query header"))?;
+    let query_message = Message::from_slice(query)
+        .map_err(|_| Error::RustError("malformed DNS query header".into()))?;
     let response_info = parse_message(response)?;
     if !response_info.qr || response_info.opcode != query_message.header().opcode() {
-        return Err(wire_error("DNS response header does not match query"));
+        return Err(Error::RustError(
+            "DNS response header does not match query".into(),
+        ));
     }
 
-    let response_message =
-        Message::from_slice(response).map_err(|_| wire_error("malformed DNS response header"))?;
+    let response_message = Message::from_slice(response)
+        .map_err(|_| Error::RustError("malformed DNS response header".into()))?;
     if !response_message.is_answer(query_message) {
-        return Err(wire_error("DNS response does not match query"));
+        return Err(Error::RustError("DNS response does not match query".into()));
     }
     Ok(())
 }
@@ -532,28 +540,28 @@ pub(super) fn age(response: &mut [u8], seconds: u32) -> Result<()> {
         }
         let dst = response
             .get_mut(record.ttl_offset..record.ttl_offset + 4)
-            .ok_or_else(|| wire_error("DNS field offset out of range"))?;
+            .ok_or_else(|| Error::RustError("DNS field offset out of range".into()))?;
         dst.copy_from_slice(&record.ttl.saturating_sub(seconds).to_be_bytes());
     }
     Ok(())
 }
 
 pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
-    if payload.len() > DNS_MAX_MESSAGE_LEN {
-        return Err(wire_error("DNS message is too large"));
+    if payload.len() > u16::MAX as usize {
+        return Err(Error::RustError("DNS message is too large".into()));
     }
     let message = Message::from_slice(payload)
-        .map_err(|_| wire_error("DNS message is shorter than its header"))?;
+        .map_err(|_| Error::RustError("DNS message is shorter than its header".into()))?;
 
     let mut questions = message.question();
     let mut question_types = Vec::new();
     let mut question_type_offsets = Vec::new();
     while let Some(question) = questions.next() {
-        let question = question.map_err(|_| wire_error("malformed DNS question"))?;
+        let question = question.map_err(|_| Error::RustError("malformed DNS question".into()))?;
         let offset = questions
             .pos()
             .checked_sub(4)
-            .ok_or_else(|| wire_error("invalid DNS question offset"))?;
+            .ok_or_else(|| Error::RustError("invalid DNS question offset".into()))?;
         question_types.push(question.qtype());
         question_type_offsets.push(offset);
     }
@@ -562,37 +570,38 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
     let counts = message.header_counts();
     let mut records = Vec::new();
     let mut opt = None;
-    let mut opt_count = 0_usize;
-    let mut ext_rcode = 0_u8;
+    let mut opt_count = 0;
+    let mut ext_rcode = 0;
     let mut has_ecs = false;
     let mut ecs_ranges = Vec::new();
     let mut has_cookie = false;
     let mut signed = false;
     let mut section = message
         .answer()
-        .map_err(|_| wire_error("malformed DNS answer section"))?;
+        .map_err(|_| Error::RustError("malformed DNS answer section".into()))?;
 
     for section_kind in [Section::Answer, Section::Authority, Section::Additional] {
         while let Some(record) = section.next() {
-            let record = record.map_err(|_| wire_error("malformed DNS resource record"))?;
+            let record =
+                record.map_err(|_| Error::RustError("malformed DNS resource record".into()))?;
             let end = section.pos();
             let rtype = record.rtype();
             let rdlen = usize::from(record.rdlen());
             let rdata_start = end
                 .checked_sub(rdlen)
-                .ok_or_else(|| wire_error("invalid DNS resource-data length"))?;
+                .ok_or_else(|| Error::RustError("invalid DNS resource-data length".into()))?;
             let rdlen_offset = rdata_start
                 .checked_sub(2)
-                .ok_or_else(|| wire_error("invalid DNS resource-data offset"))?;
+                .ok_or_else(|| Error::RustError("invalid DNS resource-data offset".into()))?;
             let ttl_offset = rdata_start
                 .checked_sub(6)
-                .ok_or_else(|| wire_error("invalid DNS TTL offset"))?;
+                .ok_or_else(|| Error::RustError("invalid DNS TTL offset".into()))?;
             let ttl = record.ttl().as_secs();
             let owner_is_root = record.owner().is_root();
 
             let parsed_rr = record
                 .to_any_record::<AllRecordData<&[u8], ParsedName<&[u8]>>>()
-                .map_err(|_| wire_error("malformed DNS resource data"))?;
+                .map_err(|_| Error::RustError("malformed DNS resource data".into()))?;
             let rdata = parsed_rr.into_data();
 
             if rtype == Rtype::TSIG
@@ -606,19 +615,20 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
             let mut soa_minimum = None;
             if rtype == Rtype::OPT {
                 if section_kind != Section::Additional || !owner_is_root {
-                    return Err(wire_error("invalid EDNS OPT record"));
+                    return Err(Error::RustError("invalid EDNS OPT record".into()));
                 }
                 opt_count += 1;
                 if opt_count > 1 {
-                    return Err(wire_error("multiple EDNS OPT records"));
+                    return Err(Error::RustError("multiple EDNS OPT records".into()));
                 }
                 ext_rcode = (ttl >> 24) as u8;
                 let AllRecordData::Opt(options) = rdata else {
-                    return Err(wire_error("malformed EDNS OPT data"));
+                    return Err(Error::RustError("malformed EDNS OPT data".into()));
                 };
                 let mut option_pos = rdata_start;
                 for option in options.iter::<UnknownOptData<&[u8]>>() {
-                    let option = option.map_err(|_| wire_error("malformed EDNS option"))?;
+                    let option =
+                        option.map_err(|_| Error::RustError("malformed EDNS option".into()))?;
                     let option_end = option_pos + 4 + option.as_slice().len();
                     match u16::from(option.code()) {
                         EDNS_OPTION_ECS => {
@@ -640,7 +650,7 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
                     AllRecordData::Soa(soa) => {
                         soa_minimum = Some(soa.minimum().as_secs());
                     }
-                    _ => return Err(wire_error("malformed SOA resource data")),
+                    _ => return Err(Error::RustError("malformed SOA resource data".into())),
                 }
             }
 
@@ -655,13 +665,13 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
 
         if section_kind == Section::Additional {
             if section.pos() != payload.len() {
-                return Err(wire_error("trailing bytes after DNS sections"));
+                return Err(Error::RustError("trailing bytes after DNS sections".into()));
             }
         } else {
             section = section
                 .next_section()
-                .map_err(|_| wire_error("malformed DNS record section"))?
-                .ok_or_else(|| wire_error("missing DNS record section"))?;
+                .map_err(|_| Error::RustError("malformed DNS record section".into()))?
+                .ok_or_else(|| Error::RustError("missing DNS record section".into()))?;
         }
     }
 
@@ -684,11 +694,6 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
     })
 }
 
-pub(super) fn response_is_success(response: &[u8]) -> Result<bool> {
-    let rcode = parse_message(response)?.rcode;
-    Ok(rcode == OptRcode::NOERROR || rcode == OptRcode::NXDOMAIN)
-}
-
 fn response_has_address_answer(response: &[u8], address_type: Rtype) -> Result<bool> {
     let parsed = parse_message(response)?;
     Ok(parsed.rcode == OptRcode::NOERROR
@@ -700,46 +705,46 @@ fn response_has_address_answer(response: &[u8], address_type: Rtype) -> Result<b
 
 fn make_nodata_response(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
     if query.len() < 12 || !(12..=query.len()).contains(&question_end) {
-        return Err(wire_error("invalid DNS question bounds"));
+        return Err(Error::RustError("invalid DNS question bounds".into()));
     }
     let parsed = parse_message(query)?;
     let mut response = query
         .get(..question_end)
-        .ok_or_else(|| wire_error("invalid DNS question bounds"))?
+        .ok_or_else(|| Error::RustError("invalid DNS question bounds".into()))?
         .to_vec();
     let query_flags = query
         .get(2..4)
         .and_then(|flags| flags.try_into().ok())
         .map(u16::from_be_bytes)
-        .ok_or_else(|| wire_error("DNS query flags out of range"))?;
+        .ok_or_else(|| Error::RustError("DNS query flags out of range".into()))?;
     let response_flags = (query_flags & 0x7800) | (query_flags & 0x0100) | 0x8080;
     response
         .get_mut(2..4)
-        .ok_or_else(|| wire_error("DNS response flags out of range"))?
+        .ok_or_else(|| Error::RustError("DNS response flags out of range".into()))?
         .copy_from_slice(&response_flags.to_be_bytes());
     response
         .get_mut(6..12)
-        .ok_or_else(|| wire_error("DNS response counts out of range"))?
+        .ok_or_else(|| Error::RustError("DNS response counts out of range".into()))?
         .fill(0);
     if let Some(opt) = parsed.opt {
         let class_offset = opt
             .rdlen_offset
             .checked_sub(6)
-            .ok_or_else(|| wire_error("invalid EDNS class offset"))?;
+            .ok_or_else(|| Error::RustError("invalid EDNS class offset".into()))?;
         let ttl_offset = opt
             .rdlen_offset
             .checked_sub(4)
-            .ok_or_else(|| wire_error("invalid EDNS TTL offset"))?;
+            .ok_or_else(|| Error::RustError("invalid EDNS TTL offset".into()))?;
         let payload_size = query
             .get(class_offset..class_offset + 2)
-            .ok_or_else(|| wire_error("EDNS class is out of range"))?;
+            .ok_or_else(|| Error::RustError("EDNS class is out of range".into()))?;
         let edns_flags = query
             .get(ttl_offset + 2..ttl_offset + 4)
-            .ok_or_else(|| wire_error("EDNS flags are out of range"))?;
+            .ok_or_else(|| Error::RustError("EDNS flags are out of range".into()))?;
         let edns_flags = edns_flags
             .try_into()
             .map(u16::from_be_bytes)
-            .map_err(|_| wire_error("EDNS flags out of range"))?;
+            .map_err(|_| Error::RustError("EDNS flags out of range".into()))?;
         let do_flag = edns_flags & 0x8000;
         response.push(0);
         response.extend_from_slice(&EDNS_OPT_RTYPE.to_be_bytes());
@@ -748,7 +753,7 @@ fn make_nodata_response(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
         response.extend_from_slice(&0_u16.to_be_bytes());
         response
             .get_mut(10..12)
-            .ok_or_else(|| wire_error("DNS additional-record count out of range"))?
+            .ok_or_else(|| Error::RustError("DNS additional-record count out of range".into()))?
             .copy_from_slice(&1_u16.to_be_bytes());
     }
     Ok(response)
@@ -757,11 +762,7 @@ fn make_nodata_response(query: &[u8], question_end: usize) -> Result<Vec<u8>> {
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<()> {
     let dst = bytes
         .get_mut(offset..offset + 2)
-        .ok_or_else(|| wire_error("DNS field offset out of range"))?;
+        .ok_or_else(|| Error::RustError("DNS field offset out of range".into()))?;
     dst.copy_from_slice(&value.to_be_bytes());
     Ok(())
-}
-
-fn wire_error(message: &str) -> Error {
-    Error::RustError(message.to_string())
 }

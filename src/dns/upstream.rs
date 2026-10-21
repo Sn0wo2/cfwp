@@ -61,16 +61,16 @@ enum Transport {
 impl DnsService {
     #[allow(clippy::single_call_fn)]
     pub(crate) fn new(config: DnsConfig, origin: &str) -> Result<Self> {
-        let probe_key: Rc<str> = Rc::from(format!("{origin}\0{}", serde_json::to_string(&config)?));
+        let probe_key = Rc::from(format!("{origin}\0{}", serde_json::to_string(&config)?));
 
         if config.servers.is_empty() {
-            return Err(config::config_error(
-                "servers must contain at least one DNS server",
+            return Err(Error::RustError(
+                "invalid DNS config: servers must contain at least one DNS server".into(),
             ));
         }
-        if config.servers.len() > config::MAX_SERVERS {
-            return Err(config::config_error(
-                "servers may contain at most 16 DNS servers",
+        if config.servers.len() > 16 {
+            return Err(Error::RustError(
+                "invalid DNS config: servers may contain at most 16 DNS servers".into(),
             ));
         }
         let mut server_tags = std::collections::HashSet::new();
@@ -78,34 +78,38 @@ impl DnsService {
             if let Some(tag) = &server.tag
                 && (tag.trim().is_empty() || tag.trim() != tag || !server_tags.insert(tag))
             {
-                return Err(config::config_error(
-                    "DNS server tags must be nonempty and unique",
+                return Err(Error::RustError(
+                    "invalid DNS config: DNS server tags must be nonempty and unique".into(),
                 ));
             }
-            let _url = server.url()?;
+            server.url()?;
         }
         config::validate_timeout("timeout_ms", config.timeout_ms)?;
         config::validate_timeout("request_timeout_ms", config.request_timeout_ms)?;
         if !(1..=6).contains(&config.race_concurrency) {
-            return Err(config::config_error(
-                "race_concurrency must be between 1 and 6",
+            return Err(Error::RustError(
+                "invalid DNS config: race_concurrency must be between 1 and 6".into(),
             ));
         }
         config::validate_message_size("max_message_bytes", config.max_message_bytes)?;
 
         if let Some(ecs) = &config.ecs {
             if ecs.ipv4_prefix > 32 {
-                return Err(config::config_error("ecs.ipv4_prefix must not exceed 32"));
+                return Err(Error::RustError(
+                    "invalid DNS config: ecs.ipv4_prefix must not exceed 32".into(),
+                ));
             }
             if ecs.ipv6_prefix > 128 {
-                return Err(config::config_error("ecs.ipv6_prefix must not exceed 128"));
+                return Err(Error::RustError(
+                    "invalid DNS config: ecs.ipv6_prefix must not exceed 128".into(),
+                ));
             }
         }
 
         if let Some(cache) = &config.cache {
             if !(1..=86_400).contains(&cache.max_ttl) {
-                return Err(config::config_error(
-                    "cache.max_ttl must be between 1 and 86400",
+                return Err(Error::RustError(
+                    "invalid DNS config: cache.max_ttl must be between 1 and 86400".into(),
                 ));
             }
             config::validate_message_size("cache.max_message_bytes", cache.max_message_bytes)?;
@@ -119,8 +123,11 @@ impl DnsService {
                         .iter()
                         .map(|config| {
                             let value = config.url()?;
-                            let url = Url::parse(&value)
-                                .map_err(|_| config::config_error("invalid DNS server address"))?;
+                            let url = Url::parse(&value).map_err(|_| {
+                                Error::RustError(
+                                    "invalid DNS config: invalid DNS server address".into(),
+                                )
+                            })?;
 
                             if !url.username().is_empty()
                                 || url.password().is_some()
@@ -228,7 +235,7 @@ impl DnsService {
             cache: config
                 .cache
                 .as_ref()
-                    .map(|cache_config| -> Result<Rc<DnsCache>> {
+                .map(|cache_config| -> Result<Rc<DnsCache>> {
                     let mut hash = Sha256::new();
                     hash.update(b"cfwp-dns-v1\0");
                     hash.update(serde_json::to_vec(&config)?);
@@ -273,7 +280,7 @@ impl UpstreamPool {
                         let probes = self.probe.as_deref().ok_or_else(|| {
                             Error::RustError("DNS probe configuration is unavailable".into())
                         })?;
-                        let mut latencies: Vec<(usize, Option<u32>)> = Vec::new();
+                        let mut latencies = Vec::new();
                         let probe_budget =
                             f64::from(self.request_timeout_ms / 2).max(f64::from(PROBE_TIMEOUT_MS));
                         let probe_started = js_sys::Date::now();
@@ -366,7 +373,12 @@ impl UpstreamPool {
 
                     while let Some(result) = pending.next().await {
                         match result {
-                            Ok(response) if wire::response_is_success(&response.bytes)? => {
+                            Ok(response)
+                                if matches!(
+                                    wire::parse_message(&response.bytes)?.rcode,
+                                    OptRcode::NOERROR | OptRcode::NXDOMAIN
+                                ) =>
+                            {
                                 return Ok(response);
                             }
                             Ok(response) => last_dns_error = Some(response),
@@ -409,7 +421,14 @@ impl UpstreamPool {
         for offset in 0..self.upstreams.len() {
             let index = (start + offset) % self.upstreams.len();
             match self.exchange_one(index, query, retry_without_ecs).await {
-                Ok(response) if wire::response_is_success(&response.bytes)? => return Ok(response),
+                Ok(response)
+                    if matches!(
+                        wire::parse_message(&response.bytes)?.rcode,
+                        OptRcode::NOERROR | OptRcode::NXDOMAIN
+                    ) =>
+                {
+                    return Ok(response);
+                }
                 Ok(response) => last_dns_error = Some(response),
                 Err(err) => last_error = Some(err),
             }
@@ -595,7 +614,7 @@ async fn exchange_socket(
                 "DNS upstream response is too large".into(),
             ));
         }
-        let mut response = vec![0_u8; response_len];
+        let mut response = vec![0; response_len];
         socket.read_exact(&mut response).await?;
         wire::validate_response(query, &response)?;
         Ok(response)

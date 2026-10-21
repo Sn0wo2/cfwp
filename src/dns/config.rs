@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use worker::{Error, Result, Url};
 
 const MAX_TIMEOUT_MS: u32 = 60_000;
-pub(crate) const MAX_SERVERS: usize = 16;
 const MAX_MESSAGE_BYTES: usize = 65_535;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,7 +60,9 @@ impl DnsServerConfig {
     pub(crate) fn url(&self) -> Result<String> {
         let server = self.server.trim();
         if server.is_empty() || server != self.server || server.contains(['/', '?', '#', '@']) {
-            return Err(config_error("DNS server name must not be empty"));
+            return Err(Error::RustError(
+                "invalid DNS config: DNS server name must not be empty".into(),
+            ));
         }
         let raw_host = server
             .strip_prefix('[')
@@ -79,29 +80,38 @@ impl DnsServerConfig {
         };
         let port = self.server_port.unwrap_or(default_port);
         if port == 0 {
-            return Err(config_error("DNS server_port must not be zero"));
+            return Err(Error::RustError(
+                "invalid DNS config: DNS server_port must not be zero".into(),
+            ));
         }
         let path = if self.kind == DnsServerType::Https {
             let path = self.path.as_deref().unwrap_or("/dns-query");
             if !path.starts_with('/') || path.contains(['?', '#']) {
-                return Err(config_error("DNS HTTPS path must be an absolute path"));
+                return Err(Error::RustError(
+                    "invalid DNS config: DNS HTTPS path must be an absolute path".into(),
+                ));
             }
             path
         } else {
             if self.path.is_some() {
-                return Err(config_error("DNS path is only supported for HTTPS servers"));
+                return Err(Error::RustError(
+                    "invalid DNS config: DNS path is only supported for HTTPS servers".into(),
+                ));
             }
             ""
         };
-        let url = Url::parse(&format!("{scheme}://{host}:{port}{path}"))
-            .map_err(|_| config_error("invalid DNS server address"))?;
+        let url = Url::parse(&format!("{scheme}://{host}:{port}{path}")).map_err(|_| {
+            Error::RustError("invalid DNS config: invalid DNS server address".into())
+        })?;
         if url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
             || url.query().is_some()
         {
-            return Err(config_error("invalid DNS server address"));
+            return Err(Error::RustError(
+                "invalid DNS config: invalid DNS server address".into(),
+            ));
         }
         Ok(url.to_string())
     }
@@ -175,8 +185,8 @@ impl Default for CacheConfig {
 
 pub(crate) fn validate_timeout(name: &str, value: u32) -> Result<()> {
     if value == 0 || value > MAX_TIMEOUT_MS {
-        return Err(config_error(&format!(
-            "{name} must be between 1 and {MAX_TIMEOUT_MS}"
+        return Err(Error::RustError(format!(
+            "invalid DNS config: {name} must be between 1 and {MAX_TIMEOUT_MS}"
         )));
     }
     Ok(())
@@ -184,13 +194,9 @@ pub(crate) fn validate_timeout(name: &str, value: u32) -> Result<()> {
 
 pub(crate) fn validate_message_size(name: &str, value: usize) -> Result<()> {
     if !(12..=MAX_MESSAGE_BYTES).contains(&value) {
-        return Err(config_error(&format!(
-            "{name} must be between 12 and {MAX_MESSAGE_BYTES}"
+        return Err(Error::RustError(format!(
+            "invalid DNS config: {name} must be between 12 and {MAX_MESSAGE_BYTES}"
         )));
     }
     Ok(())
-}
-
-pub(crate) fn config_error(message: &str) -> Error {
-    Error::RustError(format!("invalid DNS config: {message}"))
 }
