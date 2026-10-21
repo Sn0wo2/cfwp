@@ -15,7 +15,8 @@ use worker::{Error, Result};
 
 use socksaddr::{ParseError, SocksAddr};
 
-use crate::proxy::webcrypto;
+use super::transport::{InboundStream, OutboundStream};
+use crate::{config::InboundConfig, proxy::webcrypto};
 
 const MAX_SEEN_SALTS: usize = 32 * 1024;
 
@@ -58,8 +59,8 @@ impl Codec {
     }
 }
 
-impl Decoder {
-    pub(super) async fn decode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+impl InboundStream for Decoder {
+    async fn decode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self {
             Self::Plain => Ok(Cow::Borrowed(bytes)),
             Self::Shadowsocks(decoder) => decoder.decode(bytes).await.map(Cow::Owned),
@@ -169,8 +170,8 @@ impl Decoder {
     }
 }
 
-impl Encoder {
-    pub(super) async fn encode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+impl OutboundStream for Encoder {
+    async fn encode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self {
             Self::Plain { response_header } => response_header.take().map_or_else(
                 || Ok(Cow::Borrowed(bytes)),
@@ -242,7 +243,44 @@ impl InitialRequest {
             .filter(|uuid| uuid.get_version() == Some(uuid::Version::Random))
     }
 
-    #[cfg(feature = "dns")]
+    #[allow(clippy::single_call_fn)]
+    fn vmess_auth_id_matches(chunk: &[u8], uuid: &Uuid) -> bool {
+        let Some(auth) = chunk
+            .get(..16)
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        else {
+            return false;
+        };
+        let mut seed = uuid.as_bytes().to_vec();
+        seed.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+        let cmd_key = md5::compute(seed).0;
+        let Ok(cipher) =
+            Aes128::new_from_slice(&vmess::kdf16(&cmd_key, &[b"AES Auth ID Encryption"]))
+        else {
+            return false;
+        };
+        let mut block = auth.into();
+        cipher.decrypt_block(&mut block);
+        let Some(time) = block
+            .get(..8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map(i64::from_be_bytes)
+        else {
+            return false;
+        };
+        let Some(crc) = block
+            .get(12..16)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        else {
+            return false;
+        };
+        let Some(authenticated) = block.get(..12) else {
+            return false;
+        };
+        u32::from_be_bytes(crc) == crc32fast::hash(authenticated)
+            && (i128::from(vmess::now()) - i128::from(time)).abs() <= i128::from(vmess::CLOCK_SKEW)
+    }
+
     pub(super) const fn is_dns_request(&self) -> bool {
         self.is_udp && self.port == 53
     }
@@ -259,14 +297,25 @@ impl InitialRequest {
         }
     }
 
-    #[allow(clippy::single_call_fn)]
-    pub(super) async fn parse(chunk: &[u8], user_id: &str) -> Result<Option<Self>> {
+    #[allow(clippy::collapsible_if, clippy::single_call_fn)]
+    pub(super) async fn parse(chunk: &[u8], inbounds: &[InboundConfig]) -> Result<Option<Self>> {
         if chunk.len() < 16 {
             return Ok(None);
         }
         if chunk.len() >= shadowsocks::MIN_PROBE_HEADER {
-            let compact = user_id.replace('-', "");
-            for (kind_index, kind) in shadowsocks::KINDS.into_iter().enumerate() {
+            for inbound in inbounds {
+                let InboundConfig::Shadowsocks(config) = inbound else {
+                    continue;
+                };
+                let kind_index = match config.method.as_str() {
+                    "aes-128-gcm" => 0,
+                    "aes-256-gcm" => 1,
+                    "chacha20-ietf-poly1305" => 2,
+                    _ => continue,
+                };
+                let Some(kind) = shadowsocks::KINDS.get(kind_index).copied() else {
+                    continue;
+                };
                 let salt_len = kind.salt_len();
                 let header_len = salt_len + 2 + kind.tag_len();
                 if chunk.len() < header_len {
@@ -275,326 +324,338 @@ impl InitialRequest {
                 let salt_bytes = chunk
                     .get(..salt_len)
                     .ok_or_else(|| Error::RustError("invalid request".into()))?;
-                for candidate in [compact.as_str(), user_id]
-                    .into_iter()
-                    .take(if compact == user_id { 1 } else { 2 })
-                {
-                    let mut key = vec![0; kind.key_len()];
-                    openssl_bytes_to_key(candidate.as_bytes(), &mut key);
-                    let mut decoder = shadowsocks::ChunkDecoder {
-                        cipher: shadowsocks::Cipher::new(kind, &key, salt_bytes).await?,
-                        pending: Vec::new(),
-                        expected: None,
-                    };
-                    let encrypted_address = chunk
-                        .get(salt_len..header_len)
-                        .ok_or_else(|| Error::RustError("invalid request".into()))?;
-                    if decoder.decode(encrypted_address).await.is_err() {
-                        continue;
-                    }
-                    let encrypted_payload = chunk
-                        .get(header_len..)
-                        .ok_or_else(|| Error::RustError("invalid request".into()))?;
-                    let decrypted = decoder.decode(encrypted_payload).await?;
-                    let (addr, address_index) = match SocksAddr::parse_socks(&decrypted) {
-                        Ok(parsed) => parsed,
-                        Err(ParseError::Truncated) => return Ok(None),
-                        Err(ParseError::Invalid(message)) => {
-                            return Err(Error::RustError(message.into()));
-                        }
-                    };
-                    if matches!(&addr, SocksAddr::Domain(domain, _) if domain.is_empty()) {
-                        return Err(Error::RustError("empty Shadowsocks hostname".into()));
-                    }
-                    if addr.port() == 0 {
-                        return Err(Error::RustError("invalid Shadowsocks port".into()));
-                    }
-                    let salt = (kind_index, salt_bytes.to_vec());
-                    SEEN_SALTS.with(|seen| {
-                        let mut seen = seen.borrow_mut();
-                        if seen.contains(&salt) {
-                            return Err(Error::RustError("replayed Shadowsocks salt".into()));
-                        }
-                        seen.insert(salt);
-                        if seen.len() > MAX_SEEN_SALTS {
-                            seen.pop_front();
-                        }
-                        Ok(())
-                    })?;
-                    tracing::info!("protocol: shadowsocks selected");
-                    let mut salt = vec![0; kind.salt_len()];
-                    getrandom::fill(&mut salt).map_err(|err| {
-                        Error::RustError(format!("Shadowsocks salt generation failed: {err}"))
-                    })?;
-                    return Ok(Some(Self {
-                        hostname: addr.host().into_owned(),
-                        port: addr.port(),
-                        is_udp: false,
-                        payload: decrypted
-                            .get(address_index..)
-                            .ok_or_else(|| Error::RustError("invalid request".into()))?
-                            .to_vec(),
-                        codec: Codec {
-                            inbound: Decoder::Shadowsocks(decoder),
-                            outbound: Encoder::Shadowsocks(shadowsocks::ChunkEncoder {
-                                cipher: shadowsocks::Cipher::new(kind, &key, &salt).await?,
-                                salt: Some(salt),
-                            }),
-                        },
-                    }));
+                let mut key = vec![0; kind.key_len()];
+                openssl_bytes_to_key(config.password.as_bytes(), &mut key);
+                let mut decoder = shadowsocks::ChunkDecoder {
+                    cipher: shadowsocks::Cipher::new(kind, &key, salt_bytes).await?,
+                    pending: Vec::new(),
+                    expected: None,
+                };
+                let encrypted_address = chunk
+                    .get(salt_len..header_len)
+                    .ok_or_else(|| Error::RustError("invalid request".into()))?;
+                if decoder.decode(encrypted_address).await.is_err() {
+                    continue;
                 }
+                let encrypted_payload = chunk
+                    .get(header_len..)
+                    .ok_or_else(|| Error::RustError("invalid request".into()))?;
+                let decrypted = decoder.decode(encrypted_payload).await?;
+                let (addr, address_index) = match SocksAddr::parse_socks(&decrypted) {
+                    Ok(parsed) => parsed,
+                    Err(ParseError::Truncated) => return Ok(None),
+                    Err(ParseError::Invalid(message)) => {
+                        return Err(Error::RustError(message.into()));
+                    }
+                };
+                if matches!(&addr, SocksAddr::Domain(domain, _) if domain.is_empty()) {
+                    return Err(Error::RustError("empty Shadowsocks hostname".into()));
+                }
+                if addr.port() == 0 {
+                    return Err(Error::RustError("invalid Shadowsocks port".into()));
+                }
+                let salt = (kind_index, salt_bytes.to_vec());
+                SEEN_SALTS.with(|seen| {
+                    let mut seen = seen.borrow_mut();
+                    if seen.contains(&salt) {
+                        return Err(Error::RustError("replayed Shadowsocks salt".into()));
+                    }
+                    seen.insert(salt);
+                    if seen.len() > MAX_SEEN_SALTS {
+                        seen.pop_front();
+                    }
+                    Ok(())
+                })?;
+                tracing::info!("protocol: shadowsocks selected");
+                let mut salt = vec![0; kind.salt_len()];
+                getrandom::fill(&mut salt).map_err(|err| {
+                    Error::RustError(format!("Shadowsocks salt generation failed: {err}"))
+                })?;
+                return Ok(Some(Self {
+                    hostname: addr.host().into_owned(),
+                    port: addr.port(),
+                    is_udp: false,
+                    payload: decrypted
+                        .get(address_index..)
+                        .ok_or_else(|| Error::RustError("invalid request".into()))?
+                        .to_vec(),
+                    codec: Codec {
+                        inbound: Decoder::Shadowsocks(decoder),
+                        outbound: Encoder::Shadowsocks(shadowsocks::ChunkEncoder {
+                            cipher: shadowsocks::Cipher::new(kind, &key, &salt).await?,
+                            salt: Some(salt),
+                        }),
+                    },
+                }));
             }
         }
 
-        if let Some(request) = 'vmess: {
-            if chunk.len() < 16 {
-                break 'vmess None;
-            }
-            let Some(uuid) = Self::parse_uuid_v4(user_id) else {
-                break 'vmess None;
+        let vmess_uuid = inbounds.iter().find_map(|inbound| {
+            let InboundConfig::Vmess(config) = inbound else {
+                return None;
             };
-            let mut seed = uuid.as_bytes().to_vec();
-            seed.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-            let cmd_key = md5::compute(seed).0;
-            let auth: [u8; 16] = chunk
-                .get(..16)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let mut block = auth.into();
-            Aes128::new_from_slice(&vmess::kdf16(&cmd_key, &[b"AES Auth ID Encryption"]))
-                .map_err(|_| vmess::invalid_at("invalid encrypted request"))?
-                .decrypt_block(&mut block);
-            let Some(time_bytes) = block.get(..8).and_then(|bytes| bytes.try_into().ok()) else {
-                break 'vmess None;
-            };
-            let Some(crc_bytes) = block.get(12..16).and_then(|bytes| bytes.try_into().ok()) else {
-                break 'vmess None;
-            };
-            let Some(authenticated) = block.get(..12) else {
-                break 'vmess None;
-            };
-            let time = i64::from_be_bytes(time_bytes);
-            if u32::from_be_bytes(crc_bytes) != crc32fast::hash(authenticated)
-                || (i128::from(vmess::now()) - i128::from(time)).abs()
-                    > i128::from(vmess::CLOCK_SKEW)
-            {
-                break 'vmess None;
-            }
-            if chunk.len() < 42 {
-                return Ok(None);
-            }
-            let connection_nonce = chunk
-                .get(34..42)
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let size = u16::from_be_bytes(
-                vmess::open(
+            config.users.iter().find_map(|user| {
+                Self::parse_uuid_v4(&user.uuid)
+                    .filter(|uuid| Self::vmess_auth_id_matches(chunk, uuid))
+            })
+        });
+        if let Some(uuid) = vmess_uuid {
+            if let Some(request) = 'vmess: {
+                if chunk.len() < 16 {
+                    break 'vmess None;
+                }
+                let mut seed = uuid.as_bytes().to_vec();
+                seed.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+                let cmd_key = md5::compute(seed).0;
+                let auth: [u8; 16] = chunk
+                    .get(..16)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let mut block = auth.into();
+                Aes128::new_from_slice(&vmess::kdf16(&cmd_key, &[b"AES Auth ID Encryption"]))
+                    .map_err(|_| vmess::invalid_at("invalid encrypted request"))?
+                    .decrypt_block(&mut block);
+                let Some(time_bytes) = block.get(..8).and_then(|bytes| bytes.try_into().ok())
+                else {
+                    break 'vmess None;
+                };
+                let Some(crc_bytes) = block.get(12..16).and_then(|bytes| bytes.try_into().ok())
+                else {
+                    break 'vmess None;
+                };
+                let Some(authenticated) = block.get(..12) else {
+                    break 'vmess None;
+                };
+                let time = i64::from_be_bytes(time_bytes);
+                if u32::from_be_bytes(crc_bytes) != crc32fast::hash(authenticated)
+                    || (i128::from(vmess::now()) - i128::from(time)).abs()
+                        > i128::from(vmess::CLOCK_SKEW)
+                {
+                    break 'vmess None;
+                }
+                if chunk.len() < 42 {
+                    return Ok(None);
+                }
+                let connection_nonce = chunk
+                    .get(34..42)
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let size = u16::from_be_bytes(
+                    vmess::open(
+                        vmess::kdf16(
+                            &cmd_key,
+                            &[b"VMess Header AEAD Key_Length", &auth, connection_nonce],
+                        ),
+                        vmess::nonce(
+                            &cmd_key,
+                            &[b"VMess Header AEAD Nonce_Length", &auth, connection_nonce],
+                        ),
+                        chunk
+                            .get(16..34)
+                            .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
+                        &auth,
+                        "header length authentication failed",
+                    )
+                    .await?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| vmess::invalid_at("invalid encrypted request"))?,
+                ) as usize;
+                if !(41..=vmess::MAX_HEADER).contains(&size) {
+                    return Err(vmess::invalid_at("invalid header length"));
+                }
+                let total = 42 + size + 16;
+                if chunk.len() < total {
+                    return Ok(None);
+                }
+                let header = vmess::open(
                     vmess::kdf16(
                         &cmd_key,
-                        &[b"VMess Header AEAD Key_Length", &auth, connection_nonce],
+                        &[b"VMess Header AEAD Key", &auth, connection_nonce],
                     ),
                     vmess::nonce(
                         &cmd_key,
-                        &[b"VMess Header AEAD Nonce_Length", &auth, connection_nonce],
+                        &[b"VMess Header AEAD Nonce", &auth, connection_nonce],
                     ),
                     chunk
-                        .get(16..34)
+                        .get(42..total)
                         .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
                     &auth,
-                    "header length authentication failed",
+                    "header authentication failed",
                 )
-                .await?
-                .as_slice()
-                .try_into()
-                .map_err(|_| vmess::invalid_at("invalid encrypted request"))?,
-            ) as usize;
-            if !(41..=vmess::MAX_HEADER).contains(&size) {
-                return Err(vmess::invalid_at("invalid header length"));
-            }
-            let total = 42 + size + 16;
-            if chunk.len() < total {
-                return Ok(None);
-            }
-            let header = vmess::open(
-                vmess::kdf16(
-                    &cmd_key,
-                    &[b"VMess Header AEAD Key", &auth, connection_nonce],
-                ),
-                vmess::nonce(
-                    &cmd_key,
-                    &[b"VMess Header AEAD Nonce", &auth, connection_nonce],
-                ),
-                chunk
-                    .get(42..total)
-                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
-                &auth,
-                "header authentication failed",
-            )
-            .await?;
-            if header.len() != size || header.first() != Some(&1) {
-                return Err(vmess::invalid_at("invalid header version or size"));
-            }
-            let mut iv = [0_u8; 16];
-            let mut key = [0_u8; 16];
-            iv.copy_from_slice(
-                header
-                    .get(1..17)
-                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
-            );
-            key.copy_from_slice(
-                header
-                    .get(17..33)
-                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
-            );
-            let option = header
-                .get(34)
-                .copied()
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let security_padding = header
-                .get(35)
-                .copied()
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let security = security_padding & 0x0f;
-            let command = header
-                .get(37)
-                .copied()
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let mux_cool = command == 3;
-            if !matches!(security, 3 | 4)
-                || header.get(36) != Some(&0)
-                || !(command == 1 || mux_cool)
-                || option & !0x0d != 0
-                || option & 0x01 == 0
-                || (option & 0x08 != 0 && option & 0x04 == 0)
-            {
-                tracing::error!("vmess: unsupported command, security, or options");
-                return Err(Error::RustError("unsupported encrypted stream mode".into()));
-            }
-            let (hostname, port, index) = if mux_cool {
-                (
-                    super::mux::MUX_COOL_HOST.to_string(),
-                    super::mux::MUX_COOL_PORT,
-                    38,
-                )
-            } else {
-                let address = header
-                    .get(38..)
-                    .ok_or_else(|| vmess::invalid_at("invalid request address"))?;
-                let (addr, consumed) = SocksAddr::parse_xray(address)
-                    .map_err(|_| vmess::invalid_at("invalid request address"))?;
-                (addr.host().into_owned(), addr.port(), 38 + consumed)
-            };
-            if index + usize::from(security_padding >> 4) + 4 != size {
-                return Err(vmess::invalid_at("invalid header padding"));
-            }
-            let checksum_start = size - 4;
-            let checksum_input = header
-                .get(..checksum_start)
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let checksum = header
-                .get(checksum_start..)
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            if checksum_input.iter().fold(0x811c_9dc5_u32, |hash, byte| {
-                (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
-            }) != u32::from_be_bytes(checksum)
-            {
-                return Err(vmess::invalid_at("header checksum mismatch"));
-            }
-            vmess::SEEN_AUTH_IDS.with(|seen| {
-                let mut seen = seen.borrow_mut();
-                let current = vmess::now();
-                if seen
-                    .get(&auth)
-                    .is_some_and(|expires_at| *expires_at >= current)
-                {
-                    return Err(vmess::invalid_at("replayed authentication ID"));
+                .await?;
+                if header.len() != size || header.first() != Some(&1) {
+                    return Err(vmess::invalid_at("invalid header version or size"));
                 }
-                if seen.len() >= 32 * 1024 {
-                    seen.retain(|_, expires_at| *expires_at >= current);
-                    if seen.len() >= 32 * 1024 {
-                        return Err(vmess::invalid_at("authentication replay cache full"));
-                    }
-                }
-                seen.insert(auth, time.saturating_add(vmess::CLOCK_SKEW));
-                Ok(())
-            })?;
-            tracing::info!("vmess: request header authenticated");
-            let response_key: [u8; 16] = Sha256::digest(key)
-                .get(..16)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let response_iv: [u8; 16] = Sha256::digest(iv)
-                .get(..16)
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
-            let mut response = vmess::seal(
-                vmess::kdf16(&response_key, &[b"AEAD Resp Header Len Key"]),
-                vmess::nonce(&response_iv, &[b"AEAD Resp Header Len IV"]),
-                &4_u16.to_be_bytes(),
-            )
-            .await?;
-            response.extend(
-                vmess::seal(
-                    vmess::kdf16(&response_key, &[b"AEAD Resp Header Key"]),
-                    vmess::nonce(&response_iv, &[b"AEAD Resp Header IV"]),
-                    &[
-                        header
-                            .get(33)
-                            .copied()
-                            .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
-                        0,
-                        0,
-                        0,
-                    ],
-                )
-                .await?,
-            );
-            let mut request = Self {
-                hostname,
-                port,
-                is_udp: false,
-                payload: Vec::new(),
-                codec: Codec {
-                    inbound: Decoder::Vmess(vmess::ChunkDecoder {
-                        cipher: vmess::body_cipher(key, security).await?,
-                        iv,
-                        options: option,
-                        masker: vmess::masker(&iv, option),
-                        counter: 0,
-                        pending: Vec::new(),
-                        expected: None,
-                        ended: false,
-                    }),
-                    outbound: Encoder::Vmess(vmess::ChunkEncoder {
-                        cipher: vmess::body_cipher(response_key, security).await?,
-                        iv: response_iv,
-                        options: option,
-                        masker: vmess::masker(&response_iv, option),
-                        counter: 0,
-                        header: Some(response),
-                    }),
-                },
-            };
-            request.payload = request
-                .codec
-                .inbound
-                .decode(
-                    chunk
-                        .get(total..)
+                let mut iv = [0_u8; 16];
+                let mut key = [0_u8; 16];
+                iv.copy_from_slice(
+                    header
+                        .get(1..17)
                         .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
+                );
+                key.copy_from_slice(
+                    header
+                        .get(17..33)
+                        .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
+                );
+                let option = header
+                    .get(34)
+                    .copied()
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let security_padding = header
+                    .get(35)
+                    .copied()
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let security = security_padding & 0x0f;
+                let command = header
+                    .get(37)
+                    .copied()
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let mux_cool = command == 3;
+                if !matches!(security, 3 | 4)
+                    || header.get(36) != Some(&0)
+                    || !(command == 1 || mux_cool)
+                    || option & !0x0d != 0
+                    || option & 0x01 == 0
+                    || (option & 0x08 != 0 && option & 0x04 == 0)
+                {
+                    tracing::error!("vmess: unsupported command, security, or options");
+                    return Err(Error::RustError("unsupported encrypted stream mode".into()));
+                }
+                let (hostname, port, index) = if mux_cool {
+                    (
+                        super::mux::MUX_COOL_HOST.to_string(),
+                        super::mux::MUX_COOL_PORT,
+                        38,
+                    )
+                } else {
+                    let address = header
+                        .get(38..)
+                        .ok_or_else(|| vmess::invalid_at("invalid request address"))?;
+                    let (addr, consumed) = SocksAddr::parse_xray(address)
+                        .map_err(|_| vmess::invalid_at("invalid request address"))?;
+                    (addr.host().into_owned(), addr.port(), 38 + consumed)
+                };
+                if index + usize::from(security_padding >> 4) + 4 != size {
+                    return Err(vmess::invalid_at("invalid header padding"));
+                }
+                let checksum_start = size - 4;
+                let checksum_input = header
+                    .get(..checksum_start)
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let checksum = header
+                    .get(checksum_start..)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                if checksum_input.iter().fold(0x811c_9dc5_u32, |hash, byte| {
+                    (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+                }) != u32::from_be_bytes(checksum)
+                {
+                    return Err(vmess::invalid_at("header checksum mismatch"));
+                }
+                vmess::SEEN_AUTH_IDS.with(|seen| {
+                    let mut seen = seen.borrow_mut();
+                    let current = vmess::now();
+                    if seen
+                        .get(&auth)
+                        .is_some_and(|expires_at| *expires_at >= current)
+                    {
+                        return Err(vmess::invalid_at("replayed authentication ID"));
+                    }
+                    if seen.len() >= 32 * 1024 {
+                        seen.retain(|_, expires_at| *expires_at >= current);
+                        if seen.len() >= 32 * 1024 {
+                            return Err(vmess::invalid_at("authentication replay cache full"));
+                        }
+                    }
+                    seen.insert(auth, time.saturating_add(vmess::CLOCK_SKEW));
+                    Ok(())
+                })?;
+                tracing::info!("vmess: request header authenticated");
+                let response_key: [u8; 16] = Sha256::digest(key)
+                    .get(..16)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let response_iv: [u8; 16] = Sha256::digest(iv)
+                    .get(..16)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?;
+                let mut response = vmess::seal(
+                    vmess::kdf16(&response_key, &[b"AEAD Resp Header Len Key"]),
+                    vmess::nonce(&response_iv, &[b"AEAD Resp Header Len IV"]),
+                    &4_u16.to_be_bytes(),
                 )
-                .await?
-                .into_owned();
-            break 'vmess Some(request);
-        } {
-            tracing::info!("protocol: vmess selected");
-            return Ok(Some(request));
+                .await?;
+                response.extend(
+                    vmess::seal(
+                        vmess::kdf16(&response_key, &[b"AEAD Resp Header Key"]),
+                        vmess::nonce(&response_iv, &[b"AEAD Resp Header IV"]),
+                        &[
+                            header
+                                .get(33)
+                                .copied()
+                                .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
+                            0,
+                            0,
+                            0,
+                        ],
+                    )
+                    .await?,
+                );
+                let mut request = Self {
+                    hostname,
+                    port,
+                    is_udp: false,
+                    payload: Vec::new(),
+                    codec: Codec {
+                        inbound: Decoder::Vmess(vmess::ChunkDecoder {
+                            cipher: vmess::body_cipher(key, security).await?,
+                            iv,
+                            options: option,
+                            masker: vmess::masker(&iv, option),
+                            counter: 0,
+                            pending: Vec::new(),
+                            expected: None,
+                            ended: false,
+                        }),
+                        outbound: Encoder::Vmess(vmess::ChunkEncoder {
+                            cipher: vmess::body_cipher(response_key, security).await?,
+                            iv: response_iv,
+                            options: option,
+                            masker: vmess::masker(&response_iv, option),
+                            counter: 0,
+                            header: Some(response),
+                        }),
+                    },
+                };
+                request.payload = request
+                    .codec
+                    .inbound
+                    .decode(
+                        chunk
+                            .get(total..)
+                            .ok_or_else(|| vmess::invalid_at("invalid encrypted request"))?,
+                    )
+                    .await?
+                    .into_owned();
+                break 'vmess Some(request);
+            } {
+                tracing::info!("protocol: vmess selected");
+                return Ok(Some(request));
+            }
         }
 
         let is_vless = chunk.get(..17).is_some_and(|header| {
             header.first() == Some(&0)
-                && Self::parse_uuid_v4(user_id)
-                    .is_some_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
+                && inbounds.iter().any(|inbound| {
+                    let InboundConfig::Vless(config) = inbound else {
+                        return false;
+                    };
+                    config.users.iter().any(|user| {
+                        Self::parse_uuid_v4(&user.uuid)
+                            .is_some_and(|id| header.get(1..17) == Some(id.as_bytes().as_slice()))
+                    })
+                })
         });
         if is_vless {
             tracing::info!("protocol: vless selected");
@@ -696,9 +757,16 @@ impl InitialRequest {
                     .ok_or_else(|| Error::RustError("invalid access token".into()))?,
             )
             .map_err(|_| Error::RustError("invalid access token".into()))?;
-            if provided != hex::encode(Sha224::digest(user_id.as_bytes()))
-                && provided != hex::encode(Sha224::digest(user_id.replace('-', "").as_bytes()))
-            {
+            let authenticated = inbounds.iter().any(|inbound| {
+                let InboundConfig::Trojan(config) = inbound else {
+                    return false;
+                };
+                config
+                    .users
+                    .iter()
+                    .any(|user| provided == hex::encode(Sha224::digest(user.password.as_bytes())))
+            });
+            if !authenticated {
                 tracing::error!("trojan: authentication failed");
                 return Err(Error::RustError("invalid access token".into()));
             }

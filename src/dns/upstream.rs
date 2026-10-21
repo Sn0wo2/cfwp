@@ -6,7 +6,7 @@ use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use worker::{
-    AbortController, Env, Error, Fetch, Headers, Method, Request, RequestInit, Result, Socket, Url,
+    AbortController, Error, Fetch, Headers, Method, Request, RequestInit, Result, Socket, Url,
 };
 
 use crate::util::with_timeout;
@@ -49,7 +49,6 @@ pub(super) struct UpstreamResponse {
 #[derive(Clone, Debug)]
 struct CompiledUpstream {
     transport: Transport,
-    timeout_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,35 +60,29 @@ enum Transport {
 
 impl DnsService {
     #[allow(clippy::single_call_fn)]
-    pub(crate) fn new(env: &Env, origin: &str, user_id: &str) -> Result<Self> {
-        let dns_env = env.var("DNS").ok().map(|value| value.to_string());
-        let config: DnsConfig = match &dns_env {
-            Some(value) => serde_json::from_str(value)
-                .map_err(|err| Error::RustError(format!("DNS is invalid: {err}")))?,
-            None => DnsConfig::default(),
-        };
-        let probe_key: Rc<str> = Rc::from(format!(
-            "{origin}\0{user_id}\0{}",
-            dns_env.as_deref().unwrap_or_default()
-        ));
+    pub(crate) fn new(config: DnsConfig, origin: &str) -> Result<Self> {
+        let probe_key: Rc<str> = Rc::from(format!("{origin}\0{}", serde_json::to_string(&config)?));
 
-        if config.upstreams.is_empty() {
+        if config.servers.is_empty() {
             return Err(config::config_error(
-                "upstreams must contain at least one URL",
+                "servers must contain at least one DNS server",
             ));
         }
-        if config.upstreams.len() > config::MAX_UPSTREAMS {
+        if config.servers.len() > config::MAX_SERVERS {
             return Err(config::config_error(
-                "upstreams may contain at most 16 URLs",
+                "servers may contain at most 16 DNS servers",
             ));
         }
-        for upstream in &config.upstreams {
-            if upstream.url().trim().is_empty() {
-                return Err(config::config_error("upstream URLs must not be empty"));
+        let mut server_tags = std::collections::HashSet::new();
+        for server in &config.servers {
+            if let Some(tag) = &server.tag
+                && (tag.trim().is_empty() || tag.trim() != tag || !server_tags.insert(tag))
+            {
+                return Err(config::config_error(
+                    "DNS server tags must be nonempty and unique",
+                ));
             }
-            if let Some(timeout_ms) = upstream.timeout_ms() {
-                config::validate_timeout("upstream timeout_ms", timeout_ms)?;
-            }
+            let _url = server.url()?;
         }
         config::validate_timeout("timeout_ms", config.timeout_ms)?;
         config::validate_timeout("request_timeout_ms", config.request_timeout_ms)?;
@@ -122,13 +115,12 @@ impl DnsService {
             upstreams: UpstreamPool {
             upstreams: Rc::from(
                     config
-                        .upstreams
+                        .servers
                         .iter()
                         .map(|config| {
-                            let value = config.url().trim();
-                            let url = Url::parse(value).map_err(|err| {
-                                Error::RustError(format!("invalid DNS upstream URL: {err}"))
-                            })?;
+                            let value = config.url()?;
+                            let url = Url::parse(&value)
+                                .map_err(|_| config::config_error("invalid DNS server address"))?;
 
                             if !url.username().is_empty()
                                 || url.password().is_some()
@@ -201,7 +193,6 @@ impl DnsService {
                                         ));
                                     }
                                 },
-                                timeout_ms: config.timeout_ms(),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -240,7 +231,6 @@ impl DnsService {
                     .map(|cache_config| -> Result<Rc<DnsCache>> {
                     let mut hash = Sha256::new();
                     hash.update(b"cfwp-dns-v1\0");
-                    hash.update(user_id.as_bytes());
                     hash.update(serde_json::to_vec(&config)?);
                     Ok(Rc::new(DnsCache {
                         prefix: format!(
@@ -439,11 +429,10 @@ impl UpstreamPool {
         query: &[u8],
         retry_without_ecs: Option<&[u8]>,
     ) -> Result<UpstreamResponse> {
-        let upstream = self
-            .upstreams
+        self.upstreams
             .get(index)
             .ok_or_else(|| Error::RustError("DNS upstream index is out of range".into()))?;
-        let timeout_ms = upstream.timeout_ms.unwrap_or(self.timeout_ms);
+        let timeout_ms = self.timeout_ms;
         with_timeout(timeout_ms, async {
             let bytes = self.exchange_one_query(index, query).await?;
             if let Some(retry_query) = retry_without_ecs

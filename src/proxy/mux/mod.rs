@@ -14,9 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use worker::{Error, Result, WebSocket, WebsocketEvent};
 
+use super::outbound::ProxyPlan;
 use super::protocol::{Codec, Decoder};
-use super::util::{CONNECT_TIMEOUT_MS, connect_tcp};
-use crate::util::with_timeout;
+use super::transport::{InboundStream, OutboundStream};
+use crate::dns::DnsService;
 
 pub(super) const SING_MUX_HOST: &str = "sp.mux.sing-box.arpa";
 pub(super) const SING_MUX_PORT: u16 = 444;
@@ -149,31 +150,13 @@ fn send_control(
     outbox.send(muxer.data_frame(sid, chunk));
 }
 
-fn connect_future(sid: u32, target: &SocksAddr) -> Task {
+fn connect_future(sid: u32, target: &SocksAddr, dns: DnsService, plan: ProxyPlan) -> Task {
     let host = target.host().into_owned();
     let port = target.port();
     Rc::new(RefCell::new(Box::pin(async move {
-        let mut socket = match connect_tcp(&host, port) {
-            Ok(socket) => socket,
-            Err(err) => return LoopEvent::ConnectFailed(sid, err),
-        };
-        let opened = with_timeout(CONNECT_TIMEOUT_MS, async {
-            socket.opened().await?;
-            Ok::<(), Error>(())
-        })
-        .await;
-        if !matches!(opened, Some(Ok(()))) {
-            drop(socket.close().await);
-        }
-        match opened {
-            Some(Ok(())) => LoopEvent::Connected(sid, socket),
-            Some(Err(err)) => LoopEvent::ConnectFailed(sid, err),
-            None => LoopEvent::ConnectFailed(
-                sid,
-                Error::RustError(format!(
-                    "target connection timed out after {CONNECT_TIMEOUT_MS} ms"
-                )),
-            ),
+        match plan.connect_address(&host, port, &dns).await {
+            Ok(socket) => LoopEvent::Connected(sid, socket),
+            Err(err) => LoopEvent::ConnectFailed(sid, err),
         }
     })))
 }
@@ -185,6 +168,8 @@ pub(super) async fn handle(
     codec: Codec,
     initial: Vec<u8>,
     mode: MuxMode,
+    plan: ProxyPlan,
+    dns: DnsService,
 ) -> Result<()> {
     let Codec {
         inbound: mut decoder,
@@ -407,7 +392,7 @@ pub(super) async fn handle(
                             Stream {
                                 shared,
                                 phase: StreamPhase::Active {
-                                    fut: connect_future(sid, &target),
+                                    fut: connect_future(sid, &target, dns.clone(), plan.clone()),
                                 },
                             },
                         );
@@ -613,7 +598,7 @@ pub(super) async fn handle(
                     tracing::info!("mux: stream {sid} -> {target}");
                     if let Some(stream) = streams.get_mut(&sid) {
                         stream.phase = StreamPhase::Active {
-                            fut: connect_future(sid, &target),
+                            fut: connect_future(sid, &target, dns.clone(), plan.clone()),
                         };
                     }
                 }

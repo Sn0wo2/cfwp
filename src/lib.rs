@@ -1,82 +1,14 @@
-#[cfg(not(any(feature = "dns", feature = "proxy")))]
-compile_error!("enable at least one feature: dns or proxy");
-
 mod config;
-#[cfg(feature = "dns")]
 mod dns;
 
-#[cfg(feature = "dns")]
 use crate::dns::DnsError;
-#[cfg(feature = "dns")]
 use crate::dns::util::read_body;
-#[cfg(feature = "dns")]
 use base64::Engine;
-#[cfg(feature = "dns")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-#[cfg(feature = "proxy")]
 mod proxy;
 mod util;
 
 use worker::*;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Route {
-    #[cfg(feature = "dns")]
-    Dns,
-    #[cfg(feature = "proxy")]
-    Proxy,
-}
-
-struct Routes {
-    user_id: String,
-    #[cfg(feature = "dns")]
-    dns: String,
-    #[cfg(feature = "proxy")]
-    proxy: [String; 2],
-}
-
-impl Routes {
-    fn route(&self, path: &str) -> Option<Route> {
-        #[cfg(feature = "dns")]
-        if self.dns == path {
-            return Some(Route::Dns);
-        }
-        #[cfg(feature = "proxy")]
-        if self.proxy.iter().any(|route| route == path) {
-            return Some(Route::Proxy);
-        }
-        None
-    }
-}
-
-#[allow(clippy::single_call_fn)]
-fn routes(env: &Env) -> Result<&'static Routes> {
-    static ROUTES: std::sync::OnceLock<std::result::Result<Routes, String>> =
-        std::sync::OnceLock::new();
-    ROUTES
-        .get_or_init(|| {
-            let user_id = env
-                .var("UUID")
-                .map_err(|_| "UUID is required".to_string())?
-                .to_string();
-            #[cfg(feature = "dns")]
-            let dns = format!("/dns-query/{user_id}");
-            #[cfg(feature = "proxy")]
-            let proxy = [
-                format!("/{user_id}"),
-                format!("/{}", user_id.replace('-', "")),
-            ];
-            Ok(Routes {
-                #[cfg(feature = "dns")]
-                dns,
-                #[cfg(feature = "proxy")]
-                proxy,
-                user_id,
-            })
-        })
-        .as_ref()
-        .map_err(|err| Error::RustError(err.clone()))
-}
 
 #[allow(clippy::single_call_fn)]
 #[event(fetch)]
@@ -99,13 +31,19 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     });
 
     let url = req.url()?;
-    #[cfg(feature = "dns")]
-    if url.path() == "/dns-query" || url.path().starts_with("/dns-query/") {
-        let routes = routes(&env)?;
-        if routes.route(url.path()) != Some(Route::Dns) {
-            return error("Not Found", 404);
-        }
-        let config = config::Config::from_env(&env, &url, &routes.user_id)?;
+    let config = config::Config::from_env(&env, &url.origin().ascii_serialization())?;
+    let websocket = req
+        .headers()
+        .get("Upgrade")
+        .ok()
+        .flatten()
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if websocket {
+        tracing::info!("fetch: websocket upgrade requested");
+        return proxy::handle(&config, req, _ctx).await;
+    }
+
+    if url.path() == "/dns-query" {
         let mut req = req;
         let limit = config.dns.config.max_message_bytes;
         let payload = match req.method() {
@@ -183,24 +121,6 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         };
     }
 
-    #[cfg(feature = "proxy")]
-    let websocket = req
-        .headers()
-        .get("Upgrade")
-        .ok()
-        .flatten()
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    #[cfg(feature = "proxy")]
-    if websocket {
-        let routes = routes(&env)?;
-        if routes.route(url.path()) != Some(Route::Proxy) {
-            return Response::error("Not Found", 404);
-        }
-        tracing::info!("fetch: websocket upgrade requested");
-        let config = config::Config::from_env(&env, &url, &routes.user_id)?;
-        return proxy::handle(&env, &config, req, _ctx).await;
-    }
-
     tracing::info!("fetch: request without websocket upgrade");
     Response::from_json(&std::collections::BTreeMap::from([(
         "msg",
@@ -208,7 +128,6 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     )]))
 }
 
-#[cfg(feature = "dns")]
 fn error(message: &str, status: u16) -> Result<Response> {
     let mut response = Response::error(message, status)?;
     response.headers_mut().set("cache-control", "no-store")?;

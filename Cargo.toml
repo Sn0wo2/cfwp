@@ -31,34 +31,8 @@ crate-type = ["cdylib"]
 
 [features]
 default = ["dns", "proxy"]
-proxy = [
-  "dep:aes",
-  "dep:chacha20poly1305",
-  "dep:crc32fast",
-  "dep:futures-channel",
-  "dep:getrandom",
-  "dep:hashlink",
-  "dep:hex",
-  "dep:hkdf",
-  "dep:httparse",
-  "dep:leb128",
-  "dep:md5",
-  "dep:mux-core",
-  "dep:mux-cool-rs",
-  "dep:percent-encoding",
-  "dep:sha1",
-  "dep:sha3",
-  "dep:shake",
-  "dep:shadowsocks-crypto",
-  "dep:smux-rs",
-  "dep:socksaddr",
-  "dep:web-sys",
-  "dep:wasm-bindgen",
-  "dep:wasm-bindgen-futures",
-  "dep:uuid",
-  "dep:yamux-rs",
-]
-dns = ["dep:domain", "dep:serde", "dep:serde_json"]
+proxy = []
+dns = []
 
 [profile.release]
 lto = true
@@ -72,37 +46,37 @@ acta = { version = "0.5.3", default-features = false, features = [
   "nerd",
   "wasm-console",
 ] }
-aes = { version = "0.9", optional = true }
+aes = "0.9"
 base64 = "0.23"
-chacha20poly1305 = { version = "0.11", optional = true }
-crc32fast = { version = "1", optional = true }
+chacha20poly1305 = "0.11"
+crc32fast = "1"
 domain = { version = "0.12", default-features = false, features = [
   "std",
-], optional = true }
-futures-channel = { version = "0.3", optional = true }
+] }
+futures-channel = "0.3"
 futures-util = "0.3"
-getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-hashlink = { version = "0.12", optional = true }
-hkdf = { version = "0.13", optional = true }
-hex = { version = "0.4", optional = true }
-httparse = { version = "1", optional = true }
-leb128 = { version = "0.2", optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+hashlink = "0.12"
+hkdf = "0.13"
+hex = "0.4"
+httparse = "1"
+leb128 = "0.2"
 js-sys = "0.3"
-md5 = { version = "0.8", optional = true }
-mux-core = { workspace = true, optional = true }
-mux-cool-rs = { workspace = true, optional = true }
-percent-encoding = { version = "2", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
-sha1 = { version = "0.11", optional = true }
+md5 = "0.8"
+mux-core = { workspace = true }
+mux-cool-rs = { workspace = true }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.11"
 sha2 = "0.11"
-sha3 = { version = "0.12", optional = true }
-shake = { version = "0.1", optional = true }
+sha3 = "0.12"
+shake = "0.1"
 tokio = { version = "1", features = ["io-util", "sync"] }
 tracing = "0.1"
-uuid = { version = "1", optional = true }
-wasm-bindgen = { version = "0.2", optional = true }
-wasm-bindgen-futures = { version = "0.4", optional = true }
+uuid = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
   "AesGcmParams",
   "BinaryType",
@@ -110,14 +84,14 @@ web-sys = { version = "0.3", features = [
   "CryptoKey",
   "SubtleCrypto",
   "WebSocket",
-], optional = true }
+] }
 worker = "0.8"
 shadowsocks-crypto = { version = "0.8", default-features = false, features = [
   "v1-aead",
-], optional = true }
-smux-rs = { workspace = true, optional = true }
-socksaddr = { workspace = true, optional = true }
-yamux-rs = { workspace = true, optional = true }
+] }
+smux-rs = { workspace = true }
+socksaddr = { workspace = true }
+yamux-rs = { workspace = true }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

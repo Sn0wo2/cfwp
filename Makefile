@@ -1,4 +1,4 @@
-.PHONY: deploy secrets dev test fmt fmt-check clippy clippy-default clippy-dns clippy-proxy lint check-wasm check-default check-dns check-proxy doc deny audit check build build-dns build-proxy build-all release release-snapshot clean
+.PHONY: deploy deploy-pages secrets secrets-pages dev pages-dev build-pages test fmt fmt-check clippy clippy-default clippy-dns clippy-proxy lint check-wasm check-default check-dns check-proxy doc deny audit check build build-dns build-proxy build-all release release-snapshot clean
 
 dev:
 	@wrangler dev --local-protocol https
@@ -7,9 +7,24 @@ deploy:
 	@echo Running deploy tool...
 	@node ./scripts/deploy.js
 
+deploy-pages:
+	@node ./scripts/deploy.js pages
+
 secrets:
 	@echo Generating secrets tool...
 	@node ./scripts/secrets.js
+
+secrets-pages:
+	@node ./scripts/secrets.js pages
+
+build-pages:
+	node ./scripts/build.js release
+	node ./scripts/package-pages.js
+
+pages-dev:
+	node ./scripts/build.js dev
+	node ./scripts/package-pages.js
+	@if [ -f .dev.vars ]; then wrangler pages dev --cwd pages --env-file .dev.vars; else wrangler pages dev --cwd pages; fi
 
 test:
 	cargo test --workspace --exclude cfwp

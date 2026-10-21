@@ -1,5 +1,11 @@
 const { createPrompt, runCommand } = require("./utils");
 
+const target = process.argv[2] || "worker";
+if (!new Set(["worker", "pages"]).has(target)) {
+  console.error("Usage: node scripts/deploy.js [worker|pages]");
+  process.exit(1);
+}
+
 function confirm(prompt, question, defaultValue) {
   return prompt
     .ask(`${question} ${defaultValue ? "[Y/n]" : "[y/N]"} `)
@@ -14,7 +20,7 @@ function confirm(prompt, question, defaultValue) {
   let prompt;
   try {
     console.log("Deployment helper\n");
-    console.log("\n==> Check Wrangler auth");
+      console.log(`\n==> Check Wrangler auth (${target})`);
     console.log("$ wrangler whoami");
     const result = runCommand("wrangler", ["whoami"], { stdio: "pipe" });
     if (result.status !== 0) {
@@ -29,7 +35,7 @@ function confirm(prompt, question, defaultValue) {
     if (await confirm(prompt, "Open secret helper first?", false)) {
       prompt.close();
       const secretStatus =
-        runCommand(process.execPath, ["scripts/secrets.js"]).status ?? 1;
+        runCommand(process.execPath, ["scripts/secrets.js", target]).status ?? 1;
       if (secretStatus !== 0) return secretStatus;
       prompt = createPrompt();
     }
@@ -37,6 +43,23 @@ function confirm(prompt, question, defaultValue) {
     if (!(await confirm(prompt, "Deploy with wrangler now?", true))) {
       console.log("Canceled.");
       return 0;
+    }
+
+    if (target === "pages") {
+      for (const args of [
+        ["scripts/build.js", "release"],
+        ["scripts/package-pages.js"],
+      ]) {
+        const result = runCommand(process.execPath, args);
+        if (result.status !== 0) return result.status ?? 1;
+      }
+      console.log("\n==> Wrangler Pages deploy");
+      console.log("$ wrangler pages deploy --cwd pages");
+      prompt.close();
+      return (
+        runCommand("wrangler", ["pages", "deploy", "--cwd", "pages"])
+          .status ?? 1
+      );
     }
 
     console.log("\n==> Wrangler deploy");

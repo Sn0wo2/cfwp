@@ -31,7 +31,6 @@ function run(command, args) {
 run("worker-build", [
   `--${mode}`,
   ".",
-  "--no-panic-recovery",
   "--no-default-features",
   "--features",
   features.join(","),

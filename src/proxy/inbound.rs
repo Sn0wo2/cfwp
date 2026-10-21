@@ -1,70 +1,50 @@
-use std::cell::Cell;
 use std::net::IpAddr;
-use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
-use worker::{
-    Context, Env, Request, Response, Result, Socket, WebSocket, WebSocketPair, WebsocketEvent,
-};
+use worker::{Context, Request, Response, Result, WebSocketPair, WebsocketEvent};
 
 use super::outbound::ProxyPlan;
-use super::protocol::{Codec, InitialRequest};
-use super::util::{CONNECT_TIMEOUT_MS, connect_tcp};
-use crate::util::with_timeout;
+use super::protocol::InitialRequest;
+use super::transport::{self, InboundStream, OutboundStream};
 
 #[allow(clippy::single_call_fn)]
 pub(crate) async fn handle(
-    env: &Env,
     config: &crate::config::Config,
     req: Request,
     ctx: Context,
 ) -> Result<Response> {
     let request_url = req.url()?;
-    let user_id = config.user_id.clone();
-
-    let mut plan = ProxyPlan {
-        entries: ProxyPlan::collect_entries(
-            env.var("PROXYIP").ok().map(|value| value.to_string()),
-            env.var("PROXY").ok().map(|value| value.to_string()),
-            false,
-        )?,
-    };
-    plan.entries.extend(ProxyPlan::collect_entries(
-        request_url
-            .query_pairs()
-            .find(|(key, _)| key.eq_ignore_ascii_case("proxyip"))
-            .map(|(_, value)| value.into_owned()),
-        request_url
-            .query_pairs()
-            .find(|(key, _)| key.eq_ignore_ascii_case("proxy"))
-            .map(|(_, value)| value.into_owned()),
-        true,
-    )?);
+    let inbounds = config
+        .inbounds
+        .iter()
+        .filter(|inbound| inbound.accepts_path(request_url.path()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if inbounds.is_empty() {
+        return Response::error("Not Found", 404);
+    }
+    let plan = ProxyPlan::from_config(config)?;
     let early_data = req
         .headers()
         .get("sec-websocket-protocol")
         .ok()
         .flatten()
         .unwrap_or_default();
-    #[cfg(feature = "dns")]
     let client_ip = req
         .headers()
         .get("CF-Connecting-IP")
         .ok()
         .flatten()
         .and_then(|value| value.parse::<IpAddr>().ok());
-    #[cfg(feature = "dns")]
-    let dns = Some(Rc::new(config.dns.clone()));
-
     let pair = WebSocketPair::new()?;
     pair.server
         .as_ref()
         .set_binary_type(web_sys::BinaryType::Arraybuffer);
     pair.server.accept()?;
     let websocket = pair.server;
+    let dns = config.dns.clone();
 
     ctx.wait_until(async move {
         tracing::info!("session: websocket accepted");
@@ -89,7 +69,7 @@ pub(crate) async fn handle(
                 match events.next().await {
                     Some(event) => match event? {
                         WebsocketEvent::Message(message) => {
-                            if let Some(payload) = decode_message(message) {
+                            if let Some(payload) = transport::decode_message(message) {
                                 tracing::info!(
                                     "session: first websocket message ({} bytes)",
                                     payload.len()
@@ -119,7 +99,7 @@ pub(crate) async fn handle(
                 Vec::new()
             };
             let mut request = match loop {
-                match InitialRequest::parse(&initial, &user_id).await {
+                match InitialRequest::parse(&initial, &inbounds).await {
                     Ok(Some(mut request)) => {
                         if !trailing.is_empty() {
                             let decoded = request.codec.inbound.decode(&trailing).await?;
@@ -129,7 +109,7 @@ pub(crate) async fn handle(
                     }
                     Ok(None) if initial.len() < MAX_INITIAL_HEADER => match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
-                            if let Some(bytes) = decode_message(message) {
+                            if let Some(bytes) = transport::decode_message(message) {
                                 tracing::info!("session: continued header ({} bytes)", bytes.len());
                                 let remaining = MAX_INITIAL_HEADER - initial.len();
                                 if bytes.len() > remaining {
@@ -206,17 +186,13 @@ pub(crate) async fn handle(
                 return Ok(());
             }
 
-            #[cfg(feature = "dns")]
             let udp_only = request.is_udp && !request.is_dns_request();
-            #[cfg(not(feature = "dns"))]
-            let udp_only = request.is_udp;
             if udp_only {
                 tracing::info!("session: UDP request unsupported");
                 websocket.close(Some(1003), Some("udp unsupported"))?;
                 return Ok(());
             }
 
-            #[cfg(feature = "dns")]
             if request.is_dns_request() {
                 tracing::info!("session: forwarding DNS request");
                 let mut pending = std::mem::take(&mut request.payload);
@@ -244,13 +220,9 @@ pub(crate) async fn handle(
                         let query = pending.get(2..frame_end).ok_or_else(|| {
                             worker::Error::RustError("invalid DNS packet frame".into())
                         })?;
-                        let response = match dns.as_ref() {
-                            Some(dns) => {
-                                dns.exchange_prepared(dns.prepare(query, client_ip)?)
-                                    .await?
-                            }
-                            None => return Ok(()),
-                        };
+                        let response = dns
+                            .exchange_prepared(dns.prepare(query, client_ip)?)
+                            .await?;
                         let response_length = u16::try_from(response.len()).map_err(|_| {
                             worker::Error::RustError("DNS response too large".into())
                         })?;
@@ -263,7 +235,7 @@ pub(crate) async fn handle(
 
                     match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
-                            if let Some(bytes) = decode_message(message) {
+                            if let Some(bytes) = transport::decode_message(message) {
                                 pending.extend_from_slice(
                                     &request.codec.inbound.decode(&bytes).await?,
                                 );
@@ -284,160 +256,19 @@ pub(crate) async fn handle(
             if let Some(mode) = request.mux_mode() {
                 tracing::info!("session: mux session accepted ({mode:?})");
                 let InitialRequest { payload, codec, .. } = request;
-                return super::mux::handle(&websocket, events, codec, payload, mode).await;
+                return super::mux::handle(
+                    &websocket,
+                    events,
+                    codec,
+                    payload,
+                    mode,
+                    plan,
+                    dns.clone(),
+                )
+                .await;
             }
 
-            tracing::info!("session: connecting primary target (port={})", request.port);
-            #[cfg(feature = "dns")]
-            let hostname = match dns.as_deref() {
-                Some(dns) => {
-                    use domain::base::{Message, MessageBuilder, Name, Rtype};
-                    use domain::rdata::AllRecordData;
-
-                    let resolved: Result<Option<IpAddr>> = async {
-                        if request.hostname.parse::<IpAddr>().is_ok() {
-                            return Ok(None);
-                        }
-                        let Ok(name) = Name::vec_from_str(&request.hostname) else {
-                            return Ok(None);
-                        };
-                        let mut id = [0_u8; 2];
-                        getrandom::fill(&mut id)
-                            .map_err(|_| worker::Error::RustError("rng failed".into()))?;
-                        let mut builder = MessageBuilder::new_vec();
-                        builder.header_mut().set_id(u16::from_be_bytes(id));
-                        builder.header_mut().set_rd(true);
-                        let mut question = builder.question();
-                        question.push((name, Rtype::A)).map_err(|_| {
-                            worker::Error::RustError("invalid DNS query name".into())
-                        })?;
-                        let query = question.into_message().into_octets();
-
-                        let response = dns.exchange(&query, None).await.map_err(|err| {
-                            worker::Error::RustError(format!("DNS resolution failed: {err}"))
-                        })?;
-                        let Ok(message) = Message::from_octets(&response) else {
-                            return Ok(None);
-                        };
-                        if message.header().rcode() != domain::base::iana::Rcode::NOERROR {
-                            return Ok(None);
-                        }
-                        let Ok(answer) = message.answer() else {
-                            return Ok(None);
-                        };
-                        for parsed in answer.flatten() {
-                            if parsed.rtype() != Rtype::A && parsed.rtype() != Rtype::AAAA {
-                                continue;
-                            }
-                            let Ok(Some(record)) = parsed.into_record::<
-                                AllRecordData<
-                                    &[u8],
-                                    domain::base::name::ParsedName<&[u8]>,
-                                >,
-                            >() else {
-                                continue;
-                            };
-                            return Ok(match record.data() {
-                                AllRecordData::A(a) => Some(IpAddr::V4(a.addr())),
-                                AllRecordData::Aaaa(a) => Some(IpAddr::V6(a.addr())),
-                                _ => None,
-                            });
-                        }
-                        Ok(None)
-                    }
-                    .await;
-                    match resolved {
-                        Ok(Some(ip)) => ip.to_string(),
-                        Ok(None) => request.hostname.clone(),
-                        Err(err) => {
-                            tracing::warn!("session: DNS resolution failed, using hostname: {err}");
-                            request.hostname.clone()
-                        }
-                    }
-                }
-                None => request.hostname.clone(),
-            };
-            #[cfg(not(feature = "dns"))]
-            let hostname = request.hostname.clone();
-            match match connect_tcp(&hostname, request.port) {
-                Err(err) => Err(err),
-                Ok(mut socket) => match with_timeout(CONNECT_TIMEOUT_MS, async {
-                    socket.opened().await?;
-                    if !request.payload.is_empty() {
-                        socket.write_all(&request.payload).await?;
-                        socket.flush().await?;
-                    }
-                    Ok(())
-                })
-                .await
-                {
-                    Some(Ok(())) => Ok(socket),
-                    Some(Err(err)) => {
-                        drop(socket.close().await);
-                        Err(err)
-                    }
-                    None => {
-                        drop(socket.close().await);
-                        Err(worker::Error::RustError(format!(
-                            "target connection timed out after {CONNECT_TIMEOUT_MS} ms"
-                        )))
-                    }
-                },
-            } {
-                Ok(mut socket) => {
-                    tracing::info!("session: primary connection opened");
-                    let (has_data, has_client_data) = match pipe_streams(
-                        &websocket,
-                        &mut events,
-                        &mut socket,
-                        &mut request.codec,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            drop(socket.close().await);
-                            return Err(err);
-                        }
-                    };
-                    drop(socket.close().await);
-                    tracing::info!("session: primary stream ended (remote_data={has_data})");
-                    if has_data || has_client_data || !plan.has_entries() {
-                        websocket.close(None, None::<String>)?;
-                        return Ok(());
-                    }
-                    tracing::info!("session: trying alternate route after empty response");
-                    let mut fallback = plan.connect_via_entries(&request).await?;
-                    if let Err(err) =
-                        pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
-                            .await
-                    {
-                        drop(fallback.close().await);
-                        return Err(err);
-                    }
-                    drop(fallback.close().await);
-                    websocket.close(None, None::<String>)?;
-                    Ok(())
-                }
-                Err(err) => {
-                    tracing::error!("session: primary connection failed: {err:?}");
-                    if !plan.has_entries() {
-                        return Err(err);
-                    }
-                    tracing::info!("session: trying alternate route");
-                    let mut fallback = plan.connect_via_entries(&request).await?;
-                    if let Err(err) =
-                        pipe_streams(&websocket, &mut events, &mut fallback, &mut request.codec)
-                            .await
-                    {
-                        drop(fallback.close().await);
-                        return Err(err);
-                    }
-                    drop(fallback.close().await);
-                    websocket.close(None, None::<String>)?;
-                    Ok(())
-                }
-            }
+            transport::route(&websocket, &mut events, &mut request, &plan, &dns).await
         }
         .await
         {
@@ -447,74 +278,4 @@ pub(crate) async fn handle(
     });
 
     Response::from_websocket(pair.client)
-}
-
-async fn pipe_streams(
-    websocket: &WebSocket,
-    events: &mut worker::EventStream<'_>,
-    socket: &mut Socket,
-    codec: &mut Codec,
-) -> Result<(bool, bool)> {
-    let (mut reader_socket, mut writer_socket) = split(socket);
-    let (decoder, encoder) = (&mut codec.inbound, &mut codec.outbound);
-    let websocket = websocket.clone();
-    let client_data = Rc::new(Cell::new(false));
-    let client_data_writer = client_data.clone();
-    let reader = async move {
-        let mut buf = vec![0_u8; 16 * 1024];
-        let mut has_data = false;
-        loop {
-            let read = reader_socket.read(&mut buf).await?;
-            if read == 0 {
-                break;
-            }
-            has_data = true;
-            let bytes = buf
-                .get(..read)
-                .ok_or_else(|| worker::Error::RustError("invalid socket read length".into()))?;
-            websocket.send_with_bytes(encoder.encode(bytes).await?)?;
-        }
-        Ok::<bool, worker::Error>(has_data)
-    };
-    let writer = async move {
-        while let Some(event) = events.next().await {
-            match event? {
-                WebsocketEvent::Message(message) => {
-                    if let Some(payload) = decode_message(message) {
-                        let decoded = decoder.decode(&payload).await?;
-                        if !decoded.is_empty() {
-                            client_data_writer.set(true);
-                            writer_socket.write_all(&decoded).await?;
-                            writer_socket.flush().await?;
-                        }
-                    }
-                }
-                WebsocketEvent::Close(_) => break,
-            }
-        }
-
-        writer_socket.shutdown().await?;
-        Ok::<(), worker::Error>(())
-    };
-
-    match futures_util::future::select(Box::pin(reader), Box::pin(writer)).await {
-        futures_util::future::Either::Left((result, _)) => {
-            result.map(|has_data| (has_data, client_data.get()))
-        }
-        futures_util::future::Either::Right((result, _)) => {
-            result?;
-            Ok((true, client_data.get()))
-        }
-    }
-}
-
-fn decode_message(message: worker::MessageEvent) -> Option<Vec<u8>> {
-    message
-        .bytes()
-        .filter(|bytes| !bytes.is_empty())
-        .or_else(|| {
-            message
-                .text()
-                .and_then(|text| (!text.is_empty()).then_some(text.into_bytes()))
-        })
 }

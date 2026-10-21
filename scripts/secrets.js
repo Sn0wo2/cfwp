@@ -3,9 +3,17 @@ const { resolve } = require("node:path");
 const { parseEnv } = require("node:util");
 const { createPrompt, runCommand } = require("./utils");
 
-const KNOWN_SECRETS = ["UUID", "PROXYIP", "PROXY", "DNS"];
-const MASKED_KEYS = new Set(["UUID", "PROXYIP", "PROXY"]);
+const KNOWN_SECRETS = ["CONFIG"];
+const MASKED_KEYS = new Set(["CONFIG"]);
 const devVars = resolve(__dirname, "..", ".dev.vars");
+const target = process.argv[2] || "worker";
+if (!new Set(["worker", "pages"]).has(target)) {
+  console.error("Usage: node scripts/secrets.js [worker|pages]");
+  process.exit(1);
+}
+const pagesProject = "cfwp-pages";
+const remoteCommand = target === "pages" ? ["pages", "secret"] : ["secret"];
+const remoteOptions = target === "pages" ? ["--project-name", pagesProject] : [];
 
 function readLocal() {
   return new Map(
@@ -17,7 +25,7 @@ function readLocal() {
 
 function putRemote(key, value) {
   return (
-    runCommand("wrangler", ["secret", "put", key], {
+    runCommand("wrangler", [...remoteCommand, "put", key, ...remoteOptions], {
       input: `${value}\n`,
       stdio: ["pipe", "inherit", "inherit"],
     }).status === 0
@@ -30,9 +38,11 @@ function putRemote(key, value) {
     while (true) {
       let remote = null;
       for (const args of [["--format", "json"], ["--json"], []]) {
-        const result = runCommand("wrangler", ["secret", "list", ...args], {
-          stdio: "pipe",
-        });
+        const result = runCommand(
+          "wrangler",
+          [...remoteCommand, "list", ...remoteOptions, ...args],
+          { stdio: "pipe" },
+        );
         if (result.status !== 0) continue;
         const text = (result.stdout || "").trim();
         try {
@@ -64,7 +74,7 @@ function putRemote(key, value) {
       if (remote === null)
         console.warn("Could not list remote secrets; remote state is unknown.");
       const local = readLocal();
-      console.log("\nCurrent secret state\n");
+      console.log(`\nCurrent ${target} secret state\n`);
       console.log(
         `${"Name".padEnd(15)} ${"Remote".padEnd(10)} ${"Local".padEnd(30)}`,
       );

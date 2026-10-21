@@ -47,6 +47,13 @@ jobs:
         run: wrangler deploy --dry-run --config wrangler.toml
         env:
           CFWP_FEATURES: ${{ matrix.features }}
+      - name: Build and validate Pages bundle
+        working-directory: workspace/cfwp
+        run: |
+          node scripts/package-pages.js
+          wrangler pages functions build --build-output-directory pages/public --outdir build/pages-bundled --compatibility-date 2026-03-20
+        env:
+          CFWP_FEATURES: ${{ matrix.features }}
       - name: Upload Worker package
         uses: actions/upload-artifact@v7
         with:

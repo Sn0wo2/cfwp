@@ -18,5 +18,6 @@ __pycache__/
 *.pyc
 mihomo.yaml
 /dist/
+/pages/public/
 /geiger-report.md
 nul

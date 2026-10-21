@@ -17,6 +17,7 @@ archives:
       - tar.gz
     files:
       - build/index.js
+      - build/index_bg.wasm
       - build/package.json
       - build/worker/*.mjs
       - build/worker/*.wasm
