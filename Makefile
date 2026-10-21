@@ -24,7 +24,8 @@ build-pages:
 pages-dev:
 	node ./scripts/build.js dev
 	node ./scripts/package-pages.js
-	@if [ -f .dev.vars ]; then wrangler pages dev --cwd pages --env-file .dev.vars; else wrangler pages dev --cwd pages; fi
+	@if [ -f .dev.vars ]; then cp .dev.vars pages/.dev.vars; fi
+	@wrangler pages dev --cwd pages --local-protocol https
 
 test:
 	cargo test --workspace --exclude cfwp

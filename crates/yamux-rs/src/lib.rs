@@ -5,6 +5,9 @@ use std::io;
 use std::task::{Poll, Waker};
 
 use mux_core::{Event, Muxer, invalid};
+use utils::frame;
+
+mod utils;
 
 pub const WINDOW: u32 = 256 * 1024;
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -121,17 +124,6 @@ impl Muxer for Decoder {
     fn ping_ack(&self, value: u32) -> Option<Vec<u8>> {
         Some(frame(PING, FLAG_ACK, 0, value, &[]))
     }
-}
-
-fn frame(typ: u8, flags: u16, sid: u32, length: u32, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER + data.len());
-    out.push(0);
-    out.push(typ);
-    out.extend_from_slice(&flags.to_be_bytes());
-    out.extend_from_slice(&sid.to_be_bytes());
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(data);
-    out
 }
 
 #[derive(Debug, Default)]

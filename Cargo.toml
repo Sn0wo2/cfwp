@@ -17,6 +17,7 @@ repository = "https://github.com/Sn0wo2/cfwp"
 publish = false
 
 [workspace.dependencies]
+h2mux-rs = { path = "crates/h2mux-rs" }
 mux-core = { path = "crates/mux-core" }
 mux-cool-rs = { path = "crates/mux-cool-rs" }
 smux-rs = { path = "crates/smux-rs" }
@@ -63,6 +64,7 @@ httparse = "1"
 leb128 = "0.2"
 js-sys = "0.3"
 md5 = "0.8"
+h2mux-rs = { workspace = true }
 mux-core = { workspace = true }
 mux-cool-rs = { workspace = true }
 percent-encoding = "2"

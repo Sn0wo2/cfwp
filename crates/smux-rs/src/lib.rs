@@ -5,6 +5,9 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use mux_core::{Event, Muxer, invalid};
+use utils::frame;
+
+mod utils;
 
 pub const MAX_FRAME: usize = 32 * 1024;
 
@@ -131,14 +134,4 @@ impl Muxer for Decoder {
     fn reset_frame(&self, sid: u32) -> Vec<u8> {
         frame(FIN, sid, &[])
     }
-}
-
-fn frame(cmd: u8, sid: u32, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER + data.len());
-    out.push(1);
-    out.push(cmd);
-    out.extend_from_slice(&(data.len() as u16).to_le_bytes());
-    out.extend_from_slice(&sid.to_le_bytes());
-    out.extend_from_slice(data);
-    out
 }

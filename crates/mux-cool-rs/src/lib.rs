@@ -2,6 +2,9 @@ use std::io;
 
 use mux_core::{Event, Muxer, invalid};
 use socksaddr::SocksAddr;
+use utils::end_frame;
+
+mod utils;
 
 const KEEP: u8 = 2;
 const END: u8 = 3;
@@ -121,14 +124,4 @@ impl Muxer for Decoder {
     fn reset_frame(&self, sid: u32) -> Vec<u8> {
         end_frame(sid, true)
     }
-}
-
-fn end_frame(sid: u32, error: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6);
-    out.extend_from_slice(&4_u16.to_be_bytes());
-    let [_, _, sid_0, sid_1] = sid.to_be_bytes();
-    out.extend_from_slice(&[sid_0, sid_1]);
-    out.push(END);
-    out.push(if error { OPTION_ERROR } else { 0 });
-    out
 }
