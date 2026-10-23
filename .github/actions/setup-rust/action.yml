@@ -3,10 +3,13 @@ description: Install the pinned Rust toolchain and cache the workspace Cargo bui
 runs:
   using: composite
   steps:
+    - uses: ./workspace/cfwp/.github/actions/setup-path-dependencies
     - name: Install Rust toolchain
       shell: bash
+      working-directory: workspace/cfwp
       run: |
-        toolchain=nightly-2026-09-27
+        toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+        test -n "$toolchain"
         rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --component rust-src --target wasm32-unknown-unknown
         echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
     - name: Cache Cargo

@@ -3,14 +3,6 @@ name: Deploy
 on:
   workflow_dispatch:
     inputs:
-      features:
-        description: Build feature set
-        required: true
-        type: choice
-        options:
-          - proxy
-          - dns
-          - dns,proxy
       target:
         description: Cloudflare deployment target
         required: true
@@ -39,9 +31,15 @@ jobs:
       - uses: ./workspace/cfwp/.github/actions/setup-worker
       - name: Prepare Wrangler configuration
         working-directory: workspace/cfwp
+        env:
+          TARGET: ${{ inputs.target }}
         run: |
           cp wrangler.example.toml wrangler.toml
-          sed -i 's|node scripts/build.js dev|node scripts/build.js release|' wrangler.toml
+          if [ "$TARGET" = pages ]; then
+            sed -i '/^\[build\]/,$d' wrangler.toml
+          else
+            sed -i 's|make build-dev|make build|' wrangler.toml
+          fi
       - name: Check Cloudflare credentials
         shell: bash
         run: |
@@ -54,22 +52,19 @@ jobs:
         if: inputs.target == 'pages'
         working-directory: workspace/cfwp
         run: |
-          node scripts/build.js release
+          make build
           node scripts/package-pages.js
-        env:
-          CFWP_FEATURES: ${{ inputs.features }}
       - name: Deploy Worker
         if: inputs.target == 'worker'
         working-directory: workspace/cfwp
         run: wrangler deploy --config wrangler.toml
         env:
-          CFWP_FEATURES: ${{ inputs.features }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Deploy Pages
         if: inputs.target == 'pages'
         working-directory: workspace/cfwp
-        run: wrangler pages deploy --cwd pages
+        run: wrangler pages deploy --cwd pages public --project-name cfwp
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -24,6 +24,9 @@ const config = readFileSync(resolve(root, "wrangler.example.toml"), "utf8")
       skip = /^\[build(?:\]|\.)/.test(line.trim());
     return !skip;
   })
+  .map((line) =>
+    line === 'main = "build/index.js"' ? 'main = "index.js"' : line,
+  )
   .join("\n")
   .trimEnd();
 writeFileSync(resolve(root, "build/wrangler.toml"), `${config}\n`);

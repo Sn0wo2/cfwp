@@ -1,34 +1,10 @@
-.PHONY: deploy deploy-pages secrets secrets-pages dev pages-dev build-pages test fmt fmt-check clippy clippy-default clippy-dns clippy-proxy lint check-wasm check-default check-dns check-proxy doc deny audit check build build-dns build-proxy build-all release release-snapshot clean
+.DEFAULT_GOAL := ci
 
-dev:
-	@wrangler dev --local-protocol https
+CARGO_FLAGS ?=
 
-deploy:
-	@echo Running deploy tool...
-	@node ./scripts/deploy.js
+.PHONY: all fmt fmt-check check check-all-features check-no-default lint lint-fix test test-all test-no-default doc security ci build build-dev publish-dry clean
 
-deploy-pages:
-	@node ./scripts/deploy.js pages
-
-secrets:
-	@echo Generating secrets tool...
-	@node ./scripts/secrets.js
-
-secrets-pages:
-	@node ./scripts/secrets.js pages
-
-build-pages:
-	node ./scripts/build.js release
-	node ./scripts/package-pages.js
-
-pages-dev:
-	node ./scripts/build.js dev
-	node ./scripts/package-pages.js
-	@if [ -f .dev.vars ]; then cp .dev.vars pages/.dev.vars; fi
-	@wrangler pages dev --cwd pages --local-protocol https
-
-test:
-	cargo test --workspace --exclude cfwp
+all: ci
 
 fmt:
 	cargo fmt --all
@@ -36,61 +12,43 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-clippy: clippy-default clippy-dns clippy-proxy
+check:
+	cargo check --workspace --all-targets $(CARGO_FLAGS)
 
-clippy-default:
-	cargo clippy --workspace --target wasm32-unknown-unknown --all-targets -- -D warnings
+check-all-features:
+	cargo check --workspace --all-targets --all-features
 
-clippy-dns:
-	cargo clippy --workspace --target wasm32-unknown-unknown --all-targets --no-default-features --features dns -- -D warnings
+check-no-default:
+	cargo check --workspace --all-targets --no-default-features
 
-clippy-proxy:
-	cargo clippy --workspace --target wasm32-unknown-unknown --all-targets --no-default-features --features proxy -- -D warnings
+lint-fix: fmt
+	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged
 
-lint: fmt-check clippy
+lint: fmt-check
+	cargo clippy --workspace --all-targets --all-features $(CARGO_FLAGS) -- -D warnings
 
-check-wasm: check-default check-dns check-proxy
-
-check-default:
-	cargo check --workspace --target wasm32-unknown-unknown
-
-check-dns:
-	cargo check --workspace --target wasm32-unknown-unknown --no-default-features --features dns
-
-check-proxy:
-	cargo check --workspace --target wasm32-unknown-unknown --no-default-features --features proxy
+test test-all test-no-default:
+	cargo test --workspace $(patsubst test-%,--%-features,$(filter-out test,$@)) $(CARGO_FLAGS)
 
 doc:
-	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --target wasm32-unknown-unknown --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features $(CARGO_FLAGS)
 
-deny:
+security:
 	cargo deny check
 
-audit:
-	cargo audit
-
-check: fmt-check check-wasm clippy test doc deny audit
+ci: lint check check-no-default test test-all test-no-default doc security
 
 build:
-	node ./scripts/build.js release
+	worker-build --release --out-dir build .
+	node scripts/package.js
 
-build-dns:
-	CFWP_FEATURES=dns node ./scripts/build.js release
+build-dev:
+	worker-build --dev --out-dir build .
+	node scripts/package.js
 
-build-proxy:
-	CFWP_FEATURES=proxy node ./scripts/build.js release
-
-build-all:
-	CFWP_FEATURES=dns,proxy node ./scripts/build.js release
-
-release:
-	node ./scripts/package.js
-	goreleaser release --clean --config .goreleaser.yml
-
-release-snapshot:
-	node ./scripts/package.js
-	goreleaser release --snapshot --clean --config .goreleaser.yml
+publish-dry:
+	cargo publish --dry-run --allow-dirty
 
 clean:
 	cargo clean
-	rm -rf dist/
+	rm -rf build dist

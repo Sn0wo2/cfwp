@@ -1,4 +1,4 @@
-name: Release
+name: Rust Release
 
 on:
   push:
@@ -7,116 +7,265 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release (ignored for snapshots)
+        description: "Version to release (e.g. 0.1.1)"
         required: true
         type: string
       snapshot:
-        description: Build a snapshot without changing versions or publishing
+        description: "Snapshot mode (no bump, no tag, no publish)"
         type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-${{ github.workflow }}-${{ github.event.repository.default_branch }}
+
+env:
+  CARGO_TERM_COLOR: always
+  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+defaults:
+  run:
+    working-directory: workspace/cfwp
 
 jobs:
-  verify:
-    name: Verify
-    uses: ./.github/workflows/verify.yml
-    secrets: inherit
-  release:
-    name: Package release
-    needs: verify
+  check-release:
+    name: Check published release
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: workspace/cfwp
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout
+        if: ${{ !inputs.snapshot }}
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: workspace/cfwp
+      - name: Check published release
+        id: check
+        if: ${{ !inputs.snapshot }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+        run: node scripts/check-release.js "v${RELEASE_VERSION#v}"
+
+  prepare:
+    name: Prepare release
+    needs: check-release
+    if: ${{ needs.check-release.outputs.skip != 'true' || inputs.snapshot }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.sha.outputs.sha }}
+      has_publishable_crates: ${{ steps.metadata.outputs.has_publishable_crates }}
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          path: workspace/cfwp
+          ref: ${{ (github.event_name == 'push' || inputs.snapshot) && github.ref || github.event.repository.default_branch }}
           fetch-depth: 0
-      - uses: ./workspace/cfwp/.github/actions/setup-worker
-      - name: Install version tooling
+          path: workspace/cfwp
+      - uses: ./workspace/cfwp/.github/actions/setup-rust
+      - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-edit
-      - name: Normalize version
-        env:
-          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
-        run: echo "VERSION=${RELEASE_VERSION#v}" >> "$GITHUB_ENV"
-      - name: Bump workspace version
-        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          tool: cargo-edit,cargo-deny
+      - name: Update manual release base
+        if: &manual-release github.event_name == 'workflow_dispatch' && !inputs.snapshot
         run: |
-          test "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH"
-          if git rev-parse --verify --quiet "refs/tags/v$VERSION"; then
-            echo "Tag v$VERSION already exists" >&2
-            exit 1
-          fi
-          cargo set-version --workspace "$VERSION"
-      - name: Validate workspace version
+          git fetch origin "$DEFAULT_BRANCH"
+          git checkout --detach FETCH_HEAD
+      - name: Normalize version
         id: version
         env:
-          SNAPSHOT: ${{ inputs.snapshot || false }}
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
         run: |
-          node <<'NODE'
-          const fs = require('node:fs');
-          const { execFileSync } = require('node:child_process');
-          const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], { encoding: 'utf8' }));
-          const versions = new Set(metadata.packages.filter(pkg => metadata.workspace_members.includes(pkg.id)).map(pkg => pkg.version));
-          if (versions.size !== 1) throw new Error('All workspace packages must share one version');
-          const [version] = versions;
-          if (process.env.SNAPSHOT !== 'true' && process.env.VERSION !== version) throw new Error('Release version must match the workspace version');
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
-          NODE
-      - name: Prepare Wrangler configuration
+          version=${RELEASE_VERSION#v}
+          if [[ $version != [0-9]* || $(npm exec --yes --package=semver@7 -- semver "$version") != "${version%%+*}" ]]; then
+            echo "Invalid semantic version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check existing release tag
+        id: tag
+        if: *manual-release
         run: |
-          cp wrangler.example.toml wrangler.toml
-          sed -i 's|node scripts/build.js dev|node scripts/build.js release|' wrangler.toml
-      - name: Build combined Worker package
-        run: wrangler deploy --dry-run --config wrangler.toml
+          if git ls-remote --exit-code --refs origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "retry=true" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            [[ $status == 2 ]] || exit "$status"
+            echo "retry=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Resume existing release tag
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot && steps.tag.outputs.retry == 'true'
+        run: |
+          git fetch origin "refs/tags/v$VERSION"
+          git checkout --detach FETCH_HEAD
+      - name: Sync workspace version
+        if: ${{ !inputs.snapshot }}
+        run: cargo set-version --workspace "$VERSION"
+      - name: Verify workspace versions and publishable crates
+        id: metadata
+        uses: actions/github-script@v9
         env:
-          CFWP_FEATURES: dns,proxy
-      - name: Install GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+          VERIFY_VERSION: ${{ !inputs.snapshot }}
         with:
-          distribution: goreleaser
-          version: "~> v2"
-          install-only: true
-      - name: Commit and tag workspace version
-        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          script: |
+            const { packages, workspace_default_members } = JSON.parse(
+              (await exec.getExecOutput("cargo", ["metadata", "--no-deps", "--format-version", "1"], { cwd: "workspace/cfwp", silent: true })).stdout,
+            )
+            const publishable = packages.filter((pkg) => pkg.publish == null || pkg.publish.includes("crates-io"))
+            if (process.env.VERIFY_VERSION === "true") {
+              const mismatches = packages.filter((pkg) =>
+                pkg.version !== process.env.VERSION && (publishable.includes(pkg) ||
+                  (workspace_default_members.includes(pkg.id) && pkg.targets.some((target) => target.kind.includes("bin")))),
+              )
+              if (mismatches.length) {
+                throw new Error(`Expected released packages to have version ${process.env.VERSION}:\n${mismatches.map((pkg) => `  ${pkg.name} ${pkg.version}`).join("\n")}`)
+              }
+            }
+            if (context.eventName === "push" && context.sha !==
+                (await exec.getExecOutput("git", ["rev-parse", "HEAD"], { cwd: "workspace/cfwp", silent: true })).stdout.trim()) {
+              throw new Error("Checked out commit does not match the pushed tag commit")
+            }
+            core.setOutput("has_publishable_crates", publishable.length > 0)
+      - name: Run gated checks
+        run: make ci
+      - name: Commit version bump
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot && steps.tag.outputs.retry != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
+          git add -A
           git diff --cached --quiet || git commit -m "chore(release): bump version to $VERSION"
+      - name: Push version commit and tag
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot && steps.tag.outputs.retry != 'true'
+        run: |
           git tag "v$VERSION"
-          git push --atomic origin "HEAD:$DEFAULT_BRANCH" "refs/tags/v$VERSION"
-      - name: Publish tagged release
-        if: "!inputs.snapshot"
-        run: make release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GORELEASER_CURRENT_TAG: v${{ steps.version.outputs.version }}
-      - name: Build release snapshot
-        if: inputs.snapshot
-        run: make release-snapshot
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GORELEASER_CURRENT_TAG: v${{ steps.version.outputs.version }}
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v7
+          git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "HEAD:refs/tags/v$VERSION"
+      - name: Record release commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  worker:
+    name: Build Worker artifact
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      snapshot: ${{ inputs.snapshot == true }}
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.snapshot }}
+    needs: [prepare, worker]
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          name: ${{ inputs.snapshot && 'snapshot-artifacts' || 'release-artifacts' }}
-          path: workspace/cfwp/dist/*
-          if-no-files-found: error
-          retention-days: ${{ inputs.snapshot && 7 || 30 }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: workspace/cfwp
+      - name: Set up Rust workspace
+        if: ${{ needs.prepare.outputs.has_publishable_crates == 'true' }}
+        uses: ./workspace/cfwp/.github/actions/setup-rust
+      - name: Install cargo-edit
+        if: ${{ needs.prepare.outputs.has_publishable_crates == 'true' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+      - name: Sync workspace version
+        if: ${{ needs.prepare.outputs.has_publishable_crates == 'true' }}
+        run: cargo set-version --workspace "$VERSION"
+      - name: Download Worker artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: worker-artifact
+          path: workspace/cfwp/dist
+      - name: Generate checksums
+        working-directory: workspace/cfwp/dist
+        run: |
+          shopt -s nullglob
+          files=(*.tar.gz)
+          if ((${#files[@]})); then sha256sum -- "${files[@]}" > checksums.txt; fi
+      - name: Verify crates.io credentials
+        if: &publish-crates needs.prepare.outputs.has_publishable_crates == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ': "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is not set}"'
+      - name: Publish to crates.io
+        if: *publish-crates
+        uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          args: --allow-dirty --no-verify --manifest-path workspace/cfwp/Cargo.toml
+      - name: Publish GitHub release
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const tag = `v${process.env.VERSION}`
+            const prerelease = process.env.VERSION.split("+", 1)[0].includes("-")
+            await github.rest.git.getRef({ ...context.repo, ref: `tags/${tag}` })
+
+            let release
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data
+            } catch (error) {
+              if (error.status !== 404) throw error
+              release = (await github.rest.repos.createRelease({
+                ...context.repo,
+                tag_name: tag,
+                name: tag,
+                draft: true,
+                prerelease,
+                generate_release_notes: true,
+              })).data
+            }
+            if (release.tag_name !== tag) throw new Error(`Release ${tag} points to an unexpected tag`)
+            if (!release.draft) throw new Error(`Release ${tag} is already published; refusing to modify it`)
+
+            const files = await (await glob.create("workspace/cfwp/dist/*.tar.gz\nworkspace/cfwp/dist/checksums.txt", { matchDirectories: false })).glob()
+            if (!files.length) throw new Error("No release artifacts found")
+
+            const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              ...context.repo,
+              release_id: release.id,
+            })
+            for (const asset of assets) {
+              await github.rest.repos.deleteReleaseAsset({ ...context.repo, asset_id: asset.id })
+            }
+
+            const { readFile, stat } = require("node:fs/promises")
+            const { basename } = require("node:path")
+            for (const file of files) {
+              const name = basename(file)
+              const contentType = name.endsWith(".tar.gz") ? "application/gzip" : "text/plain"
+              await github.rest.repos.uploadReleaseAsset({
+                ...context.repo,
+                release_id: release.id,
+                name,
+                data: await readFile(file),
+                headers: { "content-type": contentType, "content-length": (await stat(file)).size },
+              })
+            }
+
+            await github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: release.id,
+              name: tag,
+              prerelease,
+              draft: false,
+            })
