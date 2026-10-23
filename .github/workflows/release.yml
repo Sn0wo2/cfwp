@@ -242,6 +242,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tag.outputs.sha || needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: workspace/cfwp
+
+      - name: Generate changelog
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          GORELEASER_CURRENT_TAG: v${{ needs.prepare.outputs.version }}
+        with:
+          workdir: workspace/cfwp
+          args: release --clean --skip=publish
+
       - uses: actions/download-artifact@v8
         with:
           name: worker-artifact
@@ -261,7 +276,7 @@ jobs:
           tag_name: v${{ needs.prepare.outputs.version }}
           draft: true
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
-          generate_release_notes: true
+          body_path: workspace/cfwp/dist/CHANGELOG.md
           files: dist/*
           fail_on_unmatched_files: true
 
