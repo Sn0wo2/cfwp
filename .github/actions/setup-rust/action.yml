@@ -3,18 +3,40 @@ description: Install the pinned Rust toolchain and cache the workspace Cargo bui
 runs:
   using: composite
   steps:
-    - uses: ./workspace/cfwp/.github/actions/setup-path-dependencies
+    - uses: actions/checkout@v7
+      with:
+        repository: Sn0wo2/dns-over-websocket
+        ref: 0fe561dde6391e59ad6e41ca30d859505ad8812a
+        path: workspace/dns-over-websocket
+        persist-credentials: false
+    - uses: actions/checkout@v7
+      with:
+        repository: Sn0wo2/mux-core
+        ref: f5a4a62c9e09c58c31972fdd73fb183a7590088d
+        path: workspace/mux-core
+        persist-credentials: false
+    - uses: actions/checkout@v7
+      with:
+        repository: Sn0wo2/mux-cool-rs
+        ref: d13179d08ccee42457c0fef79a424896351b982e
+        path: workspace/mux-cool-rs
+        persist-credentials: false
+    - uses: actions/checkout@v7
+      with:
+        repository: Sn0wo2/h2mux-rs
+        ref: a8e6e6a9dc30232a894a3bf09be31260c4c4b847
+        path: workspace/h2mux-rs
+        persist-credentials: false
     - name: Install Rust toolchain
       shell: bash
       working-directory: workspace/cfwp
       run: |
-        toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
-        test -n "$toolchain"
-        rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy --component rust-src --target wasm32-unknown-unknown
-        echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+        rustup show
+        echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
     - name: Cache Cargo
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: workspace/cfwp -> target
         shared-key: cfwp-nightly
-        cache-on-failure: true
+        cache-workspace-crates: true
+        save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}

@@ -1,7 +1,7 @@
 debug
 target
 dist
-**/*.rs.bk
+*.rs.bk
 *.pdb
 mutants.out*/
 rustc-ice-*.txt
@@ -21,5 +21,4 @@ __pycache__/
 mihomo.yaml
 build/
 pages/public/
-geiger-report.md
 nul

@@ -15,6 +15,9 @@ on:
 permissions:
   contents: read
 
+env:
+  JS_RUNTIME: node
+
 concurrency:
   group: cloudflare-deploy
   cancel-in-progress: false
@@ -28,6 +31,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: workspace/cfwp
+          persist-credentials: false
       - uses: ./workspace/cfwp/.github/actions/setup-worker
       - name: Prepare Wrangler configuration
         working-directory: workspace/cfwp

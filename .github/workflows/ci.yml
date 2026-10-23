@@ -1,46 +1,123 @@
-name: Rust CI
+name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main, master]
   pull_request:
-    branches: ["**"]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-jobs:
-  lint:
-    name: Run lint checks
-    uses: ./.github/workflows/lint.yml
-    permissions:
-      contents: write
-      pull-requests: write
+defaults:
+  run:
+    working-directory: workspace/cfwp
 
-  worker:
-    name: Build Cloudflare Worker
-    needs: [lint, test]
+jobs:
+  check:
+    name: Checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      autofix: ${{ steps.patch.outputs.changed }}
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           path: workspace/cfwp
-      - uses: ./workspace/cfwp/.github/actions/setup-worker
-      - name: Build Worker
-        working-directory: workspace/cfwp
-        run: make build
-      - name: Validate Worker bundle
-        working-directory: workspace/cfwp
-        run: wrangler deploy --dry-run --config build/wrangler.toml
-      - name: Package Pages artifact
-        working-directory: workspace/cfwp
-        run: node scripts/package-pages.js
 
-  test:
-    name: Run tests
-    uses: ./.github/workflows/test.yml
+      - uses: ./workspace/cfwp/.github/actions/setup-rust
+
+      - name: Apply lint fixes
+        continue-on-error: true
+        run: make lint-fix
+
+      - name: Save lint fixes
+        id: patch
+        if: ${{ !cancelled() }}
+        run: |
+          if ! git diff --quiet -- '*.rs'; then
+            git diff --binary -- '*.rs' > "$RUNNER_TEMP/lint-fixes.patch"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git restore --worktree -- '*.rs'
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.patch.outputs.changed == 'true' }}
+        with:
+          name: lint-fixes
+          path: ${{ runner.temp }}/lint-fixes.patch
+          retention-days: 7
+          if-no-files-found: error
+
+      - run: make lint check check-no-default test test-all test-no-default doc
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - run: make security
+
+  autofix:
+    needs: check
+    if: >-
+      !cancelled() && needs.check.outputs.autofix == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          persist-credentials: false
+          path: workspace/cfwp
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: lint-fixes
+          path: ${{ runner.temp }}/lint-fixes
+
+      - run: git apply --include='*.rs' "$RUNNER_TEMP/lint-fixes/lint-fixes.patch"
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          path: workspace/cfwp
+          commit-message: "chore(autofix): formatting and lint"
+          branch: auto-fix/rust-${{ github.event.pull_request.number || github.ref_name }}
+          delete-branch: true
+          title: "chore(autofix): formatting and lint"
+          body: "Automated rustfmt and Clippy fixes from CI"
+          labels: automated,rust
+          add-paths: "**/*.rs"
+
+  build:
+    needs: check
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  geiger:
+    name: Unsafe code report
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: workspace/cfwp
+
+      - uses: ./workspace/cfwp/.github/actions/setup-rust
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+
+      - run: cargo geiger --all-features --output-format GitHubMarkdown >> "$GITHUB_STEP_SUMMARY"

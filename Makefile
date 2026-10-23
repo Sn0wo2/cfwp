@@ -1,8 +1,8 @@
-.DEFAULT_GOAL := ci
-
-CARGO_FLAGS ?=
+JS_RUNTIME ?= bun
 
 .PHONY: all fmt fmt-check check check-all-features check-no-default lint lint-fix test test-all test-no-default doc security ci build build-dev publish-dry clean
+
+ci: lint check check-no-default test test-all test-no-default doc security
 
 all: ci
 
@@ -36,15 +36,13 @@ doc:
 security:
 	cargo deny check
 
-ci: lint check check-no-default test test-all test-no-default doc security
-
 build:
 	worker-build --release --out-dir build .
-	node scripts/package.js
+	$(JS_RUNTIME) scripts/package.js
 
 build-dev:
 	worker-build --dev --out-dir build .
-	node scripts/package.js
+	$(JS_RUNTIME) scripts/package.js
 
 publish-dry:
 	cargo publish --dry-run --allow-dirty
