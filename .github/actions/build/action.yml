@@ -1,0 +1,61 @@
+name: Build Worker archive
+description: Build and package the Cloudflare Pages Worker
+inputs:
+  version:
+    description: Release version, if this is not a snapshot build
+    required: false
+    default: ''
+  snapshot:
+    description: Whether to build a non-publishing snapshot
+    required: false
+    default: 'true'
+  profile:
+    description: Cargo build profile
+    required: false
+    default: release
+runs:
+  using: composite
+  steps:
+    - uses: ./workspace/cfwp/.github/actions/setup-worker
+
+    - uses: taiki-e/install-action@v2
+      if: ${{ inputs.snapshot != 'true' }}
+      with:
+        tool: cargo-edit
+
+    - name: Sync workspace version
+      if: ${{ inputs.snapshot != 'true' }}
+      run: cargo set-version --workspace "$VERSION"
+      env:
+        VERSION: ${{ inputs.version }}
+      shell: bash
+      working-directory: workspace/cfwp
+
+    - name: Build Worker
+      run: make "$BUILD_TARGET"
+      env:
+        BUILD_TARGET: ${{ inputs.profile == 'debug' && 'build-dev' || 'build' }}
+        JS_RUNTIME: node
+      shell: bash
+      working-directory: workspace/cfwp
+
+    - name: Validate Worker bundle
+      run: wrangler deploy --dry-run --config build/wrangler.toml
+      shell: bash
+      working-directory: workspace/cfwp
+
+    - name: Package Pages Worker
+      run: |
+        node scripts/package-pages.js
+        mkdir -p dist
+        tar -czf dist/cfwp-pages-worker.tar.gz -C pages/public .
+      shell: bash
+      working-directory: workspace/cfwp
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: worker-artifact
+        path: workspace/cfwp/dist/cfwp-pages-worker.tar.gz
+        compression-level: 0
+        if-no-files-found: error
+        retention-days: ${{ inputs.snapshot == 'true' && 7 || 30 }}

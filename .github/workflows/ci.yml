@@ -21,9 +21,8 @@ jobs:
     name: Checks
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-    outputs:
-      autofix: ${{ steps.patch.outputs.changed }}
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -34,7 +33,9 @@ jobs:
 
       - name: Apply lint fixes
         continue-on-error: true
-        run: make lint-fix
+        run: |
+          cargo fmt-all
+          cargo lint-fix
 
       - name: Save lint fixes
         id: patch
@@ -46,47 +47,43 @@ jobs:
             git restore --worktree -- '*.rs'
           fi
 
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && steps.patch.outputs.changed == 'true' }}
-        with:
-          name: lint-fixes
-          path: ${{ runner.temp }}/lint-fixes.patch
-          retention-days: 7
-          if-no-files-found: error
-
-      - run: make lint check check-no-default test test-all test-no-default doc
+      - run: |
+          cargo fmt-check
+          cargo lint
+          cargo check-ws
+          cargo check-no-default
+          cargo test-ws
+          cargo test-all-features
+          cargo test-no-default
+          cargo doc-all
 
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
 
-      - run: make security
+      - run: cargo security
 
-  autofix:
-    needs: check
-    if: >-
-      !cancelled() && needs.check.outputs.autofix == 'true' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v7
+      - name: Checkout the branch for autofix
+        id: autofix_checkout
+        if: >-
+          !cancelled() && steps.patch.outputs.changed == 'true' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.head_ref || github.ref_name }}
           persist-credentials: false
           path: workspace/cfwp
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: lint-fixes
-          path: ${{ runner.temp }}/lint-fixes
+      - name: Apply lint fixes
+        id: apply_fix
+        if: ${{ !cancelled() && steps.autofix_checkout.outcome == 'success' }}
+        run: git apply --include='*.rs' "$RUNNER_TEMP/lint-fixes.patch"
 
-      - run: git apply --include='*.rs' "$RUNNER_TEMP/lint-fixes/lint-fixes.patch"
-
-      - uses: peter-evans/create-pull-request@v8
+      - name: Create autofix pull request
+        if: ${{ !cancelled() && steps.apply_fix.outcome == 'success' }}
+        uses: peter-evans/create-pull-request@v8
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           path: workspace/cfwp
           commit-message: "chore(autofix): formatting and lint"
           branch: auto-fix/rust-${{ github.event.pull_request.number || github.ref_name }}
@@ -97,10 +94,23 @@ jobs:
           add-paths: "**/*.rs"
 
   build:
+    name: Build Cloudflare Worker
     needs: check
-    uses: ./.github/workflows/build.yml
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: workspace/cfwp
+
+      - uses: ./workspace/cfwp/.github/actions/build
+        with:
+          snapshot: 'true'
+          profile: debug
 
   geiger:
     name: Unsafe code report

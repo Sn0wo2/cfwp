@@ -19,6 +19,9 @@ wrangler.toml
 __pycache__/
 *.pyc
 mihomo.yaml
-build/
+/build/
 pages/public/
 nul
+.zig-cache/
+.idea/
+.vscode/
