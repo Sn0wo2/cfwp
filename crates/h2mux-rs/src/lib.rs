@@ -14,7 +14,7 @@ const MAX_CONCURRENT_STREAMS: u32 = 64;
 const MAX_STREAM_REQUEST_SIZE: usize = 2 + 259;
 
 type AcceptedRequest = (Request<h2::RecvStream>, h2::server::SendResponse<Bytes>);
-type AcceptResult = Option<Result<AcceptedRequest, h2::Error>>;
+type AcceptResult = Option<Result<Box<AcceptedRequest>, h2::Error>>;
 
 enum DriverEvent {
     Accepted(AcceptResult),
@@ -44,7 +44,9 @@ where
                 return Poll::Ready(DriverEvent::Stream(result));
             }
             if let Poll::Ready(accepted) = connection.poll_accept(cx) {
-                return Poll::Ready(DriverEvent::Accepted(accepted));
+                return Poll::Ready(DriverEvent::Accepted(
+                    accepted.map(|result| result.map(Box::new)),
+                ));
             }
             Poll::Pending
         })
@@ -55,7 +57,8 @@ where
             DriverEvent::Stream(Err(error)) => {
                 tracing::warn!("h2mux: stream failed: {error:?}");
             }
-            DriverEvent::Accepted(Some(Ok((request, mut respond)))) => {
+            DriverEvent::Accepted(Some(Ok(accepted))) => {
+                let (request, mut respond) = *accepted;
                 if stream_tasks.len() >= MAX_CONCURRENT_STREAMS as usize {
                     respond.send_reset(h2::Reason::REFUSED_STREAM);
                     continue;
