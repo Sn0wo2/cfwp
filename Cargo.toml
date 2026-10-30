@@ -43,7 +43,7 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
-acta = { version = "0.5.3", default-features = false, features = [
+acta = { version = "0.8.0", default-features = false, features = [
   "nerd",
   "wasm-console",
 ] }
