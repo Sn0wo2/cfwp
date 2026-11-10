@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "acta"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b313e53eae0c372a679d0d0284bc402f3f7143157deb0da5eaec8369f59f075a"
+checksum = "d43b99eaf84fe28df57f8b1da18fc0e6f451ec95e732aad08306c4c15498a72c"
 dependencies = [
  "acta-build",
  "ansi_colours",
@@ -29,9 +29,9 @@ dependencies = [
 
 [[package]]
 name = "acta-build"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33825d7b71afc60a81e18949b26bb29669151ea08848cee0b0638fde69e48bc9"
+checksum = "764d60157fccdda7e79f215e4206ef678c9a9e7b501ca9356fdafd5980646b88"
 dependencies = [
  "walkdir",
 ]
