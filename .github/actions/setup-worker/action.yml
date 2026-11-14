@@ -6,7 +6,7 @@ runs:
     - uses: ./workspace/cfwp/.github/actions/setup-rust
     - uses: actions/setup-node@v4
       with:
-        node-version: 24
+        node-version: 26
     - name: Update package index
       shell: bash
       run: sudo apt-get update
