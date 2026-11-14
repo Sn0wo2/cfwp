@@ -87,7 +87,7 @@ web-sys = { version = "0.3", features = [
   "SubtleCrypto",
   "WebSocket",
 ] }
-worker = "0.8"
+worker = "0.9"
 shadowsocks-crypto = { version = "0.8", default-features = false, features = [
   "v1-aead",
 ] }
