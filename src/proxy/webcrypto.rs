@@ -3,24 +3,23 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{AesGcmParams, CryptoKey};
 use worker::{Error, Result};
 
+use super::util;
+
 pub(super) async fn import_aes_gcm_key(key: &[u8]) -> Result<CryptoKey> {
-    let subtle = js_sys::Reflect::get(&js_sys::global(), &"crypto".into())
-        .map_err(|_| Error::RustError("WebCrypto is unavailable".into()))
-        .map(|crypto| crypto.unchecked_into::<web_sys::Crypto>().subtle())?;
-    let usages = js_sys::Array::of2(&"encrypt".into(), &"decrypt".into());
-    let promise = subtle
-        .import_key_with_str(
-            "raw",
-            &js_sys::Uint8Array::from(key),
-            "AES-GCM",
-            false,
-            &usages.into(),
-        )
-        .map_err(|err| Error::RustError(format!("AES-GCM key import failed: {err:?}")))?;
-    JsFuture::from(promise)
-        .await
-        .map(JsCast::unchecked_into::<CryptoKey>)
-        .map_err(|err| Error::RustError(format!("AES-GCM key import failed: {err:?}")))
+    JsFuture::from(
+        util::subtle()?
+            .import_key_with_str(
+                "raw",
+                &js_sys::Uint8Array::from(key),
+                "AES-GCM",
+                false,
+                &js_sys::Array::of2(&"encrypt".into(), &"decrypt".into()).into(),
+            )
+            .map_err(|err| Error::RustError(format!("AES-GCM key import failed: {err:?}")))?,
+    )
+    .await
+    .map(JsCast::unchecked_into::<CryptoKey>)
+    .map_err(|err| Error::RustError(format!("AES-GCM key import failed: {err:?}")))
 }
 
 pub(super) async fn aes_gcm(
@@ -30,9 +29,7 @@ pub(super) async fn aes_gcm(
     data: &[u8],
     encrypt: bool,
 ) -> Result<Vec<u8>> {
-    let subtle = js_sys::Reflect::get(&js_sys::global(), &"crypto".into())
-        .map_err(|_| Error::RustError("WebCrypto is unavailable".into()))
-        .map(|crypto| crypto.unchecked_into::<web_sys::Crypto>().subtle())?;
+    let subtle = util::subtle()?;
     let params = AesGcmParams::new("AES-GCM", &js_sys::Uint8Array::from(nonce));
     if let Some(aad) = aad {
         params.set_additional_data(&js_sys::Uint8Array::from(aad));

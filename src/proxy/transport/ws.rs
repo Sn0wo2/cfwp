@@ -3,12 +3,12 @@ use std::net::IpAddr;
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use worker::{Context, Request, Response, Result, WebSocketPair, WebsocketEvent};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
+use worker::{Context, Error, Request, Response, Result, WebSocketPair, WebsocketEvent};
 
-use super::outbound::ProxyPlan;
-use super::protocol::InitialRequest;
-use super::transport::{self, InboundStream, OutboundStream};
-use super::util::decode_message;
+use super::super::inbound::InitialRequest;
+use super::super::outbound::ProxyPlan;
+use super::super::util::decode_message;
 
 #[allow(clippy::single_call_fn)]
 pub(crate) async fn handle(
@@ -93,10 +93,9 @@ pub(crate) async fn handle(
                 return Ok(());
             }
 
-            const MAX_INITIAL_HEADER: usize = 64 * 1024;
             tracing::info!("session: parsing initial payload ({} bytes)", initial.len());
-            let mut trailing = if initial.len() > MAX_INITIAL_HEADER {
-                initial.split_off(MAX_INITIAL_HEADER)
+            let mut trailing = if initial.len() > 64 * 1024 {
+                initial.split_off(64 * 1024)
             } else {
                 Vec::new()
             };
@@ -104,27 +103,19 @@ pub(crate) async fn handle(
                 match InitialRequest::parse(&initial, &inbounds).await {
                     Ok(Some(mut request)) => {
                         if !trailing.is_empty() {
-                            let decoded = request.codec.inbound.decode(&trailing).await?;
-                            request.payload.extend_from_slice(&decoded);
+                            request
+                                .payload
+                                .extend_from_slice(&request.codec.inbound.decode(&trailing).await?);
                         }
                         break Ok(request);
                     }
-                    Ok(None) if initial.len() < MAX_INITIAL_HEADER => match events.next().await {
+                    Ok(None) if initial.len() < 64 * 1024 => match events.next().await {
                         Some(Ok(WebsocketEvent::Message(message))) => {
                             if let Some(bytes) = decode_message(message) {
                                 tracing::info!("session: continued header ({} bytes)", bytes.len());
-                                let remaining = MAX_INITIAL_HEADER - initial.len();
+                                let remaining = 64 * 1024 - initial.len();
                                 if bytes.len() > remaining {
-                                    let header = bytes.get(..remaining).ok_or_else(|| {
-                                        worker::Error::RustError(
-                                            "invalid initial request boundary".into(),
-                                        )
-                                    })?;
-                                    let payload = bytes.get(remaining..).ok_or_else(|| {
-                                        worker::Error::RustError(
-                                            "invalid initial request boundary".into(),
-                                        )
-                                    })?;
+                                    let (header, payload) = bytes.split_at(remaining);
                                     initial.extend_from_slice(header);
                                     trailing.extend_from_slice(payload);
                                 } else {
@@ -133,11 +124,11 @@ pub(crate) async fn handle(
                             }
                         }
                         _ => {
-                            break Err(worker::Error::RustError("incomplete request".into()));
+                            break Err(Error::RustError("incomplete request".into()));
                         }
                     },
                     Ok(None) => {
-                        break Err(worker::Error::RustError("request too large".into()));
+                        break Err(Error::RustError("request too large".into()));
                     }
                     Err(err) => break Err(err),
                 }
@@ -178,7 +169,7 @@ pub(crate) async fn handle(
             {
                 tracing::error!("session: invalid target authority");
                 drop(websocket.close(Some(1008), Some("invalid request")));
-                return Err(worker::Error::RustError("invalid target authority".into()));
+                return Err(Error::RustError("invalid target authority".into()));
             }
 
             if request.hostname == "speed.cloudflare.com"
@@ -188,13 +179,13 @@ pub(crate) async fn handle(
                 return Ok(());
             }
 
-            if request.is_udp && !request.is_dns_request() {
+            if request.is_udp && request.port != 53 {
                 tracing::info!("session: UDP request unsupported");
                 websocket.close(Some(1003), Some("udp unsupported"))?;
                 return Ok(());
             }
 
-            if request.is_dns_request() {
+            if request.is_udp && request.port == 53 {
                 tracing::info!("session: forwarding DNS request");
                 let mut pending = std::mem::take(&mut request.payload);
                 loop {
@@ -202,36 +193,33 @@ pub(crate) async fn handle(
                         let length_bytes = pending
                             .get(..2)
                             .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-                            .ok_or_else(|| {
-                                worker::Error::RustError("invalid DNS packet frame".into())
-                            })?;
+                            .ok_or_else(|| Error::RustError("invalid DNS packet frame".into()))?;
                         let length = usize::from(u16::from_be_bytes(length_bytes));
                         if length == 0 {
-                            return Err(worker::Error::RustError(
-                                "invalid DNS packet frame".into(),
-                            ));
+                            return Err(Error::RustError("invalid DNS packet frame".into()));
                         }
-                        let frame_end = length.checked_add(2).ok_or_else(|| {
-                            worker::Error::RustError("invalid DNS packet frame".into())
-                        })?;
+                        let frame_end = length + 2;
                         if pending.len() < frame_end {
                             break;
                         }
 
-                        let query = pending.get(2..frame_end).ok_or_else(|| {
-                            worker::Error::RustError("invalid DNS packet frame".into())
-                        })?;
                         let response = dns
-                            .exchange_prepared(dns.prepare(query, client_ip)?)
+                            .exchange_prepared(dns.prepare(
+                                pending.get(2..frame_end).ok_or_else(|| {
+                                    Error::RustError("invalid DNS packet frame".into())
+                                })?,
+                                client_ip,
+                            )?)
                             .await?;
-                        let response_length = u16::try_from(response.len()).map_err(|_| {
-                            worker::Error::RustError("DNS response too large".into())
-                        })?;
                         let mut framed = Vec::with_capacity(response.len() + 2);
-                        framed.extend_from_slice(&response_length.to_be_bytes());
+                        framed.extend_from_slice(
+                            &u16::try_from(response.len())
+                                .map_err(|_| Error::RustError("DNS response too large".into()))?
+                                .to_be_bytes(),
+                        );
                         framed.extend_from_slice(&response);
                         websocket.send_with_bytes(request.codec.outbound.encode(&framed).await?)?;
-                        pending.drain(..length + 2);
+                        pending.drain(..frame_end);
                     }
 
                     match events.next().await {
@@ -247,29 +235,94 @@ pub(crate) async fn handle(
                                 websocket.close(None, None::<String>)?;
                                 return Ok(());
                             }
-                            return Err(worker::Error::RustError("incomplete DNS packet".into()));
+                            return Err(Error::RustError("incomplete DNS packet".into()));
                         }
                         Some(Err(err)) => return Err(err),
                     }
                 }
             }
 
-            if let Some(mode) = request.mux_mode() {
+            if let Some(mode) = match (request.hostname.as_str(), request.port) {
+                ("sp.mux.sing-box.arpa", 444) => Some(mux_core::Mode::SingMux),
+                ("v1.mux.cool", 9527) => Some(mux_core::Mode::MuxCool),
+                _ => None,
+            } {
                 tracing::info!("session: mux session accepted ({mode:?})");
-                let InitialRequest { payload, codec, .. } = request;
-                return super::mux::handle(
+                return super::super::mux::handle(
                     &websocket,
                     events,
-                    codec,
-                    payload,
+                    request.codec,
+                    request.payload,
                     mode,
                     plan,
-                    dns.clone(),
+                    dns,
                 )
                 .await;
             }
 
-            transport::route(&websocket, &mut events, &mut request, &plan, &dns).await
+            tracing::info!(
+                "session: connecting final outbound {} (port={})",
+                match &plan {
+                    ProxyPlan::Direct => "direct",
+                    ProxyPlan::Tproxy(_) => "tproxy",
+                    ProxyPlan::Socks4(_) => "socks4",
+                    ProxyPlan::Socks5(_) => "socks5",
+                    ProxyPlan::Http(_) => "http",
+                },
+                request.port
+            );
+            let mut socket = plan
+                .connect(&request.hostname, request.port, &request.payload, &dns)
+                .await?;
+            let result = {
+                let (mut reader_socket, mut writer_socket) = split(&mut socket);
+                let decoder = &mut request.codec.inbound;
+                let encoder = &mut request.codec.outbound;
+                let output_websocket = websocket.clone();
+                let reader = async move {
+                    let mut buf = vec![0_u8; 16 * 1024];
+                    loop {
+                        let read = reader_socket.read(&mut buf).await?;
+                        if read == 0 {
+                            return Ok::<(), Error>(());
+                        }
+                        output_websocket.send_with_bytes(
+                            encoder
+                                .encode(buf.get(..read).ok_or_else(|| {
+                                    Error::RustError("invalid socket read length".into())
+                                })?)
+                                .await?,
+                        )?;
+                    }
+                };
+                let writer = async move {
+                    while let Some(event) = events.next().await {
+                        match event? {
+                            WebsocketEvent::Message(message) => {
+                                if let Some(payload) = decode_message(message) {
+                                    let decoded = decoder.decode(&payload).await?;
+                                    if !decoded.is_empty() {
+                                        writer_socket.write_all(&decoded).await?;
+                                        writer_socket.flush().await?;
+                                    }
+                                }
+                            }
+                            WebsocketEvent::Close(_) => break,
+                        }
+                    }
+                    writer_socket.shutdown().await?;
+                    Ok::<(), Error>(())
+                };
+                futures_util::pin_mut!(reader, writer);
+                futures_util::future::select(reader, writer)
+                    .await
+                    .factor_first()
+                    .0
+            };
+            drop(socket.close().await);
+            result?;
+            websocket.close(None, None::<String>)?;
+            Ok(())
         }
         .await
         {

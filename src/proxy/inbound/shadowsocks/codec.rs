@@ -1,20 +1,14 @@
+use std::borrow::Cow;
+
 use hkdf::Hkdf;
 use sha1::Sha1;
 use shadowsocks_crypto::CipherKind;
 use web_sys::CryptoKey;
 use worker::{Error, Result};
 
-use crate::proxy::webcrypto;
+use crate::proxy::{util::increment_le, webcrypto};
 
-pub(super) const MAX_CHUNK: usize = 0x3fff;
-pub(super) const KINDS: [CipherKind; 3] = [
-    CipherKind::AES_128_GCM,
-    CipherKind::AES_256_GCM,
-    CipherKind::CHACHA20_POLY1305,
-];
-pub(super) const MIN_PROBE_HEADER: usize = 16 + 2 + 16;
-pub(super) const MAX_PROBE_HEADER: usize = 32 + 2 + 16;
-pub(super) enum Cipher {
+pub(in crate::proxy) enum Cipher {
     Soft(shadowsocks_crypto::v1::Cipher),
     Web {
         key: CryptoKey,
@@ -24,15 +18,15 @@ pub(super) enum Cipher {
 }
 
 impl Cipher {
-    pub(super) async fn new(kind: CipherKind, key: &[u8], salt: &[u8]) -> Result<Self> {
+    pub(in crate::proxy) async fn new(kind: CipherKind, key: &[u8], salt: &[u8]) -> Result<Self> {
         if !matches!(kind, CipherKind::AES_128_GCM | CipherKind::AES_256_GCM) {
             return Ok(Self::Soft(shadowsocks_crypto::v1::Cipher::new(
                 kind, key, salt,
             )));
         }
-        let hk = Hkdf::<Sha1>::new(Some(salt), key);
         let mut subkey = vec![0_u8; key.len()];
-        hk.expand(b"ss-subkey", &mut subkey)
+        Hkdf::<Sha1>::new(Some(salt), key)
+            .expand(b"ss-subkey", &mut subkey)
             .map_err(|_| Error::RustError("invalid Shadowsocks key length".into()))?;
         Ok(Self::Web {
             key: webcrypto::import_aes_gcm_key(&subkey).await?,
@@ -59,7 +53,7 @@ impl Cipher {
             }
             Self::Web { key, nonce, .. } => {
                 let packet = webcrypto::aes_gcm(key, nonce, None, plaintext, true).await?;
-                increase_nonce(nonce);
+                increment_le(nonce);
                 Ok(packet)
             }
         }
@@ -78,36 +72,26 @@ impl Cipher {
                 let plaintext = webcrypto::aes_gcm(key, nonce, None, packet, false)
                     .await
                     .ok();
-                increase_nonce(nonce);
+                increment_le(nonce);
                 plaintext
             }
         }
     }
 }
-fn increase_nonce(nonce: &mut [u8; 12]) {
-    for byte in nonce.iter_mut() {
-        let (sum, overflow) = byte.overflowing_add(1);
-        *byte = sum;
-        if !overflow {
-            return;
-        }
-    }
-}
-
 pub(in crate::proxy) struct ChunkDecoder {
-    pub(super) cipher: Cipher,
-    pub(super) pending: Vec<u8>,
-    pub(super) expected: Option<usize>,
+    pub(in crate::proxy) cipher: Cipher,
+    pub(in crate::proxy) pending: Vec<u8>,
+    pub(in crate::proxy) expected: Option<usize>,
 }
 
 impl ChunkDecoder {
-    pub(super) async fn decode(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+    pub(in crate::proxy) async fn decode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         self.pending.extend_from_slice(bytes);
         let mut plaintext = Vec::new();
         let mut pos = 0;
         let tag_len = self.cipher.tag_len();
         loop {
-            if self.expected.is_none() {
+            let Some(size) = self.expected else {
                 if self
                     .pending
                     .get(pos..)
@@ -128,14 +112,12 @@ impl ChunkDecoder {
                     .try_into()
                     .map_err(|_| Error::RustError("invalid Shadowsocks chunk length".into()))?;
                 let size = usize::from(u16::from_be_bytes(size_bytes));
-                if size > MAX_CHUNK {
+                if size > 0x3fff {
                     return Err(Error::RustError("Shadowsocks chunk too large".into()));
                 }
                 pos += 2 + tag_len;
                 self.expected = Some(size);
-            }
-            let Some(size) = self.expected else {
-                return Err(Error::RustError("invalid Shadowsocks chunk length".into()));
+                continue;
             };
             if self
                 .pending
@@ -157,11 +139,32 @@ impl ChunkDecoder {
             self.expected = None;
         }
         self.pending.drain(..pos);
-        Ok(plaintext)
+        Ok(Cow::Owned(plaintext))
     }
 }
 
 pub(in crate::proxy) struct ChunkEncoder {
-    pub(super) cipher: Cipher,
-    pub(super) salt: Option<Vec<u8>>,
+    pub(in crate::proxy) cipher: Cipher,
+    pub(in crate::proxy) salt: Option<Vec<u8>>,
+}
+
+impl ChunkEncoder {
+    pub(in crate::proxy) async fn encode<'a>(&mut self, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        if bytes.is_empty() {
+            return Ok(Cow::Borrowed(bytes));
+        }
+        let tag_len = self.cipher.tag_len();
+        let mut encrypted = self.salt.take().unwrap_or_default();
+        encrypted.reserve(bytes.len() + bytes.len().div_ceil(0x3fff) * (2 + tag_len * 2));
+        for chunk in bytes.chunks(0x3fff) {
+            encrypted.extend_from_slice(
+                &self
+                    .cipher
+                    .encrypt(&(chunk.len() as u16).to_be_bytes())
+                    .await?,
+            );
+            encrypted.extend_from_slice(&self.cipher.encrypt(chunk).await?);
+        }
+        Ok(Cow::Owned(encrypted))
+    }
 }

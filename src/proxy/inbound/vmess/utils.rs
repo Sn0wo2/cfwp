@@ -1,12 +1,6 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-
-use chacha20poly1305::ChaCha20Poly1305;
-use chacha20poly1305::KeyInit;
 use sha2::{Digest, Sha256};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
-use shake::Shake128;
-use web_sys::CryptoKey;
+use shake::{Shake128, Shake128Reader};
 use worker::{Error, Result};
 
 use crate::proxy::webcrypto;
@@ -14,10 +8,6 @@ use crate::proxy::webcrypto;
 pub(super) const MAX_HEADER: usize = 4096;
 pub(super) const MAX_CHUNK: usize = 16 * 1024;
 pub(super) const CLOCK_SKEW: i64 = 120;
-
-thread_local! {
-    pub(super) static SEEN_AUTH_IDS: RefCell<HashMap<[u8; 16], i64>> = RefCell::new(HashMap::new());
-}
 
 pub(super) fn invalid_at(stage: &str) -> Error {
     tracing::error!("vmess: {stage}");
@@ -60,6 +50,14 @@ pub(super) fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
     result
 }
 
+pub(super) fn nonce(key: &[u8], path: &[&[u8]]) -> [u8; 12] {
+    let mut result = [0_u8; 12];
+    for (destination, source) in result.iter_mut().zip(kdf(key, path)) {
+        *destination = source;
+    }
+    result
+}
+
 pub(super) async fn open(
     key: [u8; 16],
     nonce: [u8; 12],
@@ -76,14 +74,6 @@ pub(super) async fn open(
 pub(super) async fn seal(key: [u8; 16], nonce: [u8; 12], data: &[u8]) -> Result<Vec<u8>> {
     let cipher = webcrypto::import_aes_gcm_key(&key).await?;
     webcrypto::aes_gcm(&cipher, &nonce, None, data, true).await
-}
-
-pub(super) fn nonce(key: &[u8], path: &[&[u8]]) -> [u8; 12] {
-    let mut result = [0_u8; 12];
-    for (destination, source) in result.iter_mut().zip(kdf(key, path)) {
-        *destination = source;
-    }
-    result
 }
 
 #[allow(clippy::cast_sign_loss)]
@@ -108,18 +98,18 @@ pub(super) fn chunk_nonce(iv: &[u8; 16], counter: u16) -> [u8; 12] {
     nonce
 }
 
-pub(super) fn masker(iv: &[u8; 16], options: u8) -> Option<Box<dyn XofReader>> {
+pub(super) fn masker(iv: &[u8; 16], options: u8) -> Option<Shake128Reader> {
     if options & 0x04 == 0 {
         return None;
     }
     Some({
         let mut shake = Shake128::default();
         shake.update(iv);
-        Box::new(shake.finalize_xof())
+        shake.finalize_xof()
     })
 }
 
-pub(super) fn padding_length(masker: &mut Option<Box<dyn XofReader>>, options: u8) -> usize {
+pub(super) fn padding_length(masker: &mut Option<Shake128Reader>, options: u8) -> usize {
     if options & 0x08 != 0 {
         let mut mask = [0_u8; 2];
         if let Some(masker) = masker {
@@ -129,45 +119,4 @@ pub(super) fn padding_length(masker: &mut Option<Box<dyn XofReader>>, options: u
     } else {
         0
     }
-}
-
-#[allow(variant_size_differences)]
-pub(super) enum BodyCipher {
-    Aes(CryptoKey),
-    ChaCha(ChaCha20Poly1305),
-}
-
-pub(super) async fn body_cipher(key: [u8; 16], security: u8) -> Result<BodyCipher> {
-    if security == 3 {
-        Ok(BodyCipher::Aes(webcrypto::import_aes_gcm_key(&key).await?))
-    } else {
-        let first = md5::compute(key).0;
-        let mut expanded = [0_u8; 32];
-        expanded[..16].copy_from_slice(&first);
-        expanded[16..].copy_from_slice(&md5::compute(first).0);
-        Ok(BodyCipher::ChaCha(
-            ChaCha20Poly1305::new_from_slice(&expanded)
-                .map_err(|_| Error::RustError("invalid encrypted request".into()))?,
-        ))
-    }
-}
-
-pub(in crate::proxy) struct ChunkDecoder {
-    pub(super) cipher: BodyCipher,
-    pub(super) iv: [u8; 16],
-    pub(super) options: u8,
-    pub(super) masker: Option<Box<dyn XofReader>>,
-    pub(super) counter: u16,
-    pub(super) pending: Vec<u8>,
-    pub(super) expected: Option<(usize, usize)>,
-    pub(super) ended: bool,
-}
-
-pub(in crate::proxy) struct ChunkEncoder {
-    pub(super) cipher: BodyCipher,
-    pub(super) iv: [u8; 16],
-    pub(super) options: u8,
-    pub(super) masker: Option<Box<dyn XofReader>>,
-    pub(super) counter: u16,
-    pub(super) header: Option<Vec<u8>>,
 }
