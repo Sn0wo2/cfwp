@@ -14,8 +14,7 @@ const outputDir = resolve(root, "pages", "public");
 
 if (!existsSync(worker)) throw new Error("Worker build output is missing: build/index.js");
 
-const source = readFileSync(worker, "utf8");
-const wasmImport = source.match(/\bfrom\s*["']([^"']+\.wasm)["']/)?.[1];
+const wasmImport = readFileSync(worker, "utf8").match(/\bfrom\s*["']([^"']+\.wasm)["']/)?.[1];
 if (!wasmImport) throw new Error("Could not find the imported Wasm module in build/index.js");
 
 const wasm = resolve(dirname(worker), wasmImport);
