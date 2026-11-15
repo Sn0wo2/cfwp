@@ -7,21 +7,15 @@ runs:
     - uses: actions/setup-node@v4
       with:
         node-version: 24
-    - name: Update package index
-      shell: bash
-      run: sudo apt-get update
-    - name: Install Binaryen
-      shell: bash
-      run: sudo apt-get install --yes binaryen
     - name: Install worker-build
       shell: bash
-      run: cargo install worker-build --version 0.8.7 --locked
+      run: cargo install worker-build --version 0.9.0 --locked
     - name: Install Wrangler
       shell: bash
       run: npm install --global wrangler@4
     - name: Verify build tools
       shell: bash
-      run: wasm-opt --version
+      run: worker-build --version
     - name: Verify Wrangler
       shell: bash
       run: wrangler --version
