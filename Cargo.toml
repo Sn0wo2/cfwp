@@ -1,39 +1,13 @@
 [package]
 name = "cfwp"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
-
-[workspace]
-members = ["crates/*"]
-
-[workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Sn0wo2/cfwp"
 publish = false
 
-[workspace.dependencies]
-h2mux-rs = { path = "crates/h2mux-rs" }
-mux-core = { path = "crates/mux-core" }
-mux-cool-rs = { path = "crates/mux-cool-rs" }
-smux-rs = { path = "crates/smux-rs" }
-socksaddr = { path = "crates/socksaddr" }
-yamux-rs = { path = "crates/yamux-rs" }
-
-[lints]
-workspace = true
-
 [lib]
 crate-type = ["cdylib"]
-
-[features]
-default = ["dns", "proxy"]
-proxy = []
-dns = []
 
 [profile.release]
 lto = true
@@ -43,31 +17,25 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
-acta = { version = "0.8.0", default-features = false, features = [
+acta = { version = "0.8.5", default-features = false, features = [
   "nerd",
   "wasm-console",
 ] }
+dns-over-websocket = "0.0.5"
 aes = "0.9"
 base64 = "0.23"
 chacha20poly1305 = "0.11"
 crc32fast = "1"
-domain = { version = "0.12", default-features = false, features = [
-  "std",
-] }
-futures-channel = "0.3"
+domain = { version = "0.12", default-features = false, features = ["std"] }
 futures-util = "0.3"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 hashlink = "0.12"
 hkdf = "0.13"
 hex = "0.4"
 httparse = "1"
-leb128 = "0.2"
 js-sys = "0.3"
 md5 = "0.8"
-h2mux-rs = { workspace = true }
-mux-core = { workspace = true }
-mux-cool-rs = { workspace = true }
-percent-encoding = "2"
+mux-core = "0.0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
@@ -75,6 +43,7 @@ sha2 = "0.11"
 sha3 = "0.12"
 shake = "0.1"
 tokio = { version = "1", features = ["io-util", "sync"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["compat"] }
 tracing = "0.1"
 uuid = "1"
 wasm-bindgen = "0.2"
@@ -87,15 +56,14 @@ web-sys = { version = "0.3", features = [
   "SubtleCrypto",
   "WebSocket",
 ] }
-worker = "0.8"
+worker = "0.9"
 shadowsocks-crypto = { version = "0.8", default-features = false, features = [
   "v1-aead",
 ] }
-smux-rs = { workspace = true }
-socksaddr = { workspace = true }
-yamux-rs = { workspace = true }
+socksaddr = "0.0.5"
+tokio-socks = { version = "0.5.3", default-features = false, features = ["futures-io"] }
 
-[workspace.lints.rust]
+[lints.rust]
 unsafe_code = "forbid"
 future_incompatible = { level = "warn", priority = -1 }
 rust_2018_idioms = { level = "warn", priority = -1 }
@@ -116,7 +84,7 @@ unused_lifetimes = "warn"
 unused_qualifications = "warn"
 variant_size_differences = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 all = { level = "warn", priority = -1 }
 as_ptr_cast_mut = "warn"
 assigning_clones = "warn"
@@ -244,6 +212,6 @@ verbose_bit_mask = "warn"
 verbose_file_reads = "warn"
 zero_sized_map_values = "warn"
 
-[workspace.lints.rustdoc]
+[lints.rustdoc]
 broken_intra_doc_links = "deny"
 unescaped_backticks = "warn"
