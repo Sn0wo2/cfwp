@@ -3,7 +3,7 @@ description: Install worker-build, Binaryen, and Wrangler
 runs:
   using: composite
   steps:
-    - uses: ./workspace/cfwp/.github/actions/setup-rust
+    - uses: ./.github/actions/setup-rust
     - uses: actions/setup-node@v4
       with:
         node-version: 24
@@ -15,7 +15,6 @@ runs:
       run: sudo apt-get install --yes binaryen
     - name: Install worker-build
       shell: bash
-      working-directory: workspace/cfwp
       run: cargo install worker-build --version 0.8.7 --locked
     - name: Install Wrangler
       shell: bash

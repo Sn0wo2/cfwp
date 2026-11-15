@@ -30,11 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          path: workspace/cfwp
           persist-credentials: false
-      - uses: ./workspace/cfwp/.github/actions/setup-worker
+      - uses: ./.github/actions/setup-worker
       - name: Prepare Wrangler configuration
-        working-directory: workspace/cfwp
         env:
           TARGET: ${{ inputs.target }}
         run: |
@@ -54,20 +52,17 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Build and package Pages
         if: inputs.target == 'pages'
-        working-directory: workspace/cfwp
         run: |
           make build
           node scripts/package-pages.js
       - name: Deploy Worker
         if: inputs.target == 'worker'
-        working-directory: workspace/cfwp
         run: wrangler deploy --config wrangler.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Deploy Pages
         if: inputs.target == 'pages'
-        working-directory: workspace/cfwp
         run: wrangler pages deploy --cwd pages public --project-name cfwp
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

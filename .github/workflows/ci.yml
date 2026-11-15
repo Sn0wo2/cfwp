@@ -12,10 +12,6 @@ concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    working-directory: workspace/cfwp
-
 jobs:
   check:
     name: Checks
@@ -27,9 +23,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          path: workspace/cfwp
 
-      - uses: ./workspace/cfwp/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
 
       - name: Apply lint fixes
         continue-on-error: true
@@ -57,11 +52,7 @@ jobs:
           cargo test-no-default
           cargo doc-all
 
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny
-
-      - run: cargo security
+      - uses: EmbarkStudios/cargo-deny-action@v2
 
       - name: Checkout the branch for autofix
         id: autofix_checkout
@@ -72,7 +63,6 @@ jobs:
         with:
           ref: ${{ github.head_ref || github.ref_name }}
           persist-credentials: false
-          path: workspace/cfwp
 
       - name: Apply lint fixes
         id: apply_fix
@@ -86,7 +76,6 @@ jobs:
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          path: workspace/cfwp
           commit-message: "chore(autofix): formatting and lint"
           branch: auto-fix/rust-${{ github.event.pull_request.number || github.ref_name }}
           delete-branch: true
@@ -116,12 +105,29 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
-          path: workspace/cfwp
 
-      - uses: ./workspace/cfwp/.github/actions/build
+      - uses: ./.github/actions/build
         with:
           snapshot: 'true'
           profile: debug
+
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - run: cargo audit
 
   geiger:
     name: Unsafe code report
@@ -133,9 +139,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          path: workspace/cfwp
 
-      - uses: ./workspace/cfwp/.github/actions/setup-rust
+      - uses: ./.github/actions/setup-rust
 
       - uses: taiki-e/install-action@v2
         with:
