@@ -1,6 +1,9 @@
 JS_RUNTIME ?= bun
 
-.PHONY: build build-dev clean
+.PHONY: build build-dev clean check-template
+
+check-template:
+	node scripts/check-template-sync.js
 
 build:
 	worker-build --release --out-dir build .
