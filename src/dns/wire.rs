@@ -1,22 +1,24 @@
 use std::{net::IpAddr, time::Duration};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use domain::base::iana::{Opcode, OptRcode, Rtype};
 use domain::base::message::Section;
 use domain::base::opt::{ClientSubnet, ComposeOptData, UnknownOptData};
 use domain::base::{Message, ParsedName};
 use domain::rdata::AllRecordData;
-use futures_util::{FutureExt, future::select};
-use sha2::{Digest, Sha256};
-use worker::{Cache, Delay, Error, Headers, Response, Result};
+use futures_util::{
+    FutureExt,
+    future::{
+        Either::{Left, Right},
+        select,
+    },
+};
+use worker::{Delay, Error, Result};
 
-use super::{DnsError, DnsResult, DnsService, config::AddressFamily, util::read_body};
+use super::{DnsError, DnsResult, DnsService, config::AddressFamily};
 
-const DEFAULT_UDP_PAYLOAD_SIZE: u16 = 1232;
 const EDNS_OPT_RTYPE: u16 = 41;
-const EDNS_OPTION_ECS: u16 = 8;
-const EDNS_OPTION_PADDING: u16 = 12;
 
+#[derive(Clone)]
 pub(crate) struct Prepared {
     pub(super) bytes: Vec<u8>,
     pub(super) injected: bool,
@@ -60,6 +62,40 @@ pub(super) struct ParsedMessage {
     question_end: usize,
     opt: Option<OptInfo>,
     records: Vec<RecordInfo>,
+}
+
+impl ParsedMessage {
+    pub(super) fn cacheable_ttl(&self) -> Option<u32> {
+        if !self.qr
+            || self.truncated
+            || self.signed
+            || self.has_cookie
+            || (self.rcode != OptRcode::NOERROR && self.rcode != OptRcode::NXDOMAIN)
+        {
+            return None;
+        }
+        if self.answer_count > 0 && self.rcode == OptRcode::NOERROR {
+            self.records
+                .iter()
+                .filter(|record| record.rtype != Rtype::OPT)
+                .map(|record| record.ttl)
+                .min()
+        } else {
+            let negative_ttl = self
+                .records
+                .iter()
+                .filter(|record| record.section == Section::Authority)
+                .filter_map(|record| record.soa_minimum.map(|minimum| record.ttl.min(minimum)))
+                .min();
+            let record_ttl = self
+                .records
+                .iter()
+                .filter(|record| record.rtype != Rtype::OPT)
+                .map(|record| record.ttl)
+                .min();
+            negative_ttl.map(|ttl| ttl.min(record_ttl.unwrap_or(ttl)))
+        }
+    }
 }
 
 #[allow(clippy::multiple_inherent_impl)]
@@ -152,7 +188,7 @@ impl DnsService {
                 .compose_option(&mut data)
                 .map_err(|_| Error::RustError("failed to compose EDNS client subnet".into()))?;
             let mut option = Vec::with_capacity(4 + data.len());
-            option.extend_from_slice(&EDNS_OPTION_ECS.to_be_bytes());
+            option.extend_from_slice(&8_u16.to_be_bytes());
             option.extend_from_slice(
                 &u16::try_from(data.len())
                     .map_err(|_| Error::RustError("EDNS client subnet is too large".into()))?
@@ -160,52 +196,49 @@ impl DnsService {
             );
             option.extend_from_slice(&data);
 
-            if let Some(opt) = parsed.opt {
-                if opt.end != bytes.len() {
-                    cacheable = false;
-                } else if let Some(new_rdlen) = opt.rdlen.checked_add(option.len()) {
-                    if new_rdlen > usize::from(u16::MAX)
-                        || bytes
-                            .len()
-                            .checked_add(option.len())
-                            .is_none_or(|len| len > u16::MAX as usize)
-                    {
-                        cacheable = false;
-                    } else if let Ok(new_rdlen) = u16::try_from(new_rdlen) {
-                        bytes.extend_from_slice(&option);
-                        bytes
-                            .get_mut(opt.rdlen_offset..opt.rdlen_offset + 2)
-                            .ok_or_else(|| {
-                                Error::RustError("EDNS resource-data length out of range".into())
-                            })?
-                            .copy_from_slice(&new_rdlen.to_be_bytes());
-                        injected = true;
-                    } else {
-                        cacheable = false;
+            injected = 'ecs: {
+                if let Some(opt) = parsed.opt {
+                    if opt.end != bytes.len() {
+                        break 'ecs false;
                     }
+                    let Some(new_rdlen) = opt.rdlen.checked_add(option.len()) else {
+                        break 'ecs false;
+                    };
+                    if new_rdlen > usize::from(u16::MAX)
+                        || bytes.len() + option.len() > usize::from(u16::MAX)
+                    {
+                        break 'ecs false;
+                    }
+                    let Ok(new_rdlen) = u16::try_from(new_rdlen) else {
+                        break 'ecs false;
+                    };
+                    bytes.extend_from_slice(&option);
+                    bytes
+                        .get_mut(opt.rdlen_offset..opt.rdlen_offset + 2)
+                        .ok_or_else(|| {
+                            Error::RustError("EDNS resource-data length out of range".into())
+                        })?
+                        .copy_from_slice(&new_rdlen.to_be_bytes());
                 } else {
-                    cacheable = false;
-                }
-            } else {
-                let arcount = bytes
-                    .get(10..12)
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map(u16::from_be_bytes)
-                    .ok_or_else(|| {
-                        Error::RustError("DNS additional-record count out of range".into())
-                    })?;
-                if arcount == u16::MAX
-                    || bytes
-                        .len()
-                        .checked_add(11 + option.len())
-                        .is_none_or(|new_len| new_len > u16::MAX as usize)
-                    || option.len() > usize::from(u16::MAX)
-                {
-                    cacheable = false;
-                } else if let Ok(rdlen) = u16::try_from(option.len()) {
+                    let arcount = bytes
+                        .get(10..12)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u16::from_be_bytes)
+                        .ok_or_else(|| {
+                            Error::RustError("DNS additional-record count out of range".into())
+                        })?;
+                    if arcount == u16::MAX
+                        || bytes.len() + 11 + option.len() > usize::from(u16::MAX)
+                        || option.len() > usize::from(u16::MAX)
+                    {
+                        break 'ecs false;
+                    }
+                    let Ok(rdlen) = u16::try_from(option.len()) else {
+                        break 'ecs false;
+                    };
                     bytes.push(0);
                     bytes.extend_from_slice(&EDNS_OPT_RTYPE.to_be_bytes());
-                    bytes.extend_from_slice(&DEFAULT_UDP_PAYLOAD_SIZE.to_be_bytes());
+                    bytes.extend_from_slice(&1232_u16.to_be_bytes());
                     bytes.extend_from_slice(&0_u32.to_be_bytes());
                     bytes.extend_from_slice(&rdlen.to_be_bytes());
                     bytes.extend_from_slice(&option);
@@ -215,11 +248,10 @@ impl DnsService {
                             Error::RustError("DNS additional-record count out of range".into())
                         })?
                         .copy_from_slice(&(arcount + 1).to_be_bytes());
-                    injected = true;
-                } else {
-                    cacheable = false;
                 }
-            }
+                true
+            };
+            cacheable &= injected;
         }
 
         if bytes.len() > self.config.max_message_bytes {
@@ -252,22 +284,12 @@ impl DnsService {
             let offset = prepared
                 .question_type_offset
                 .ok_or_else(|| Error::RustError("missing DNS question type offset".into()))?;
-            let mut probe_bytes = prepared.bytes.clone();
-            write_u16(&mut probe_bytes, offset, u16::from(preferred_type))?;
-            let mut probe_original = prepared.original.clone();
-            if let Some(original) = &mut probe_original {
+            let mut probe = prepared.clone();
+            write_u16(&mut probe.bytes, offset, u16::from(preferred_type))?;
+            if let Some(original) = &mut probe.original {
                 write_u16(original, offset, u16::from(preferred_type))?;
             }
-            let probe = Prepared {
-                bytes: probe_bytes,
-                injected: prepared.injected,
-                cacheable: prepared.cacheable,
-                original: probe_original,
-                local_response: false,
-                question_type: Some(preferred_type),
-                question_type_offset: prepared.question_type_offset,
-                question_end: prepared.question_end,
-            };
+            probe.question_type = Some(preferred_type);
             return self
                 .exchange_preferred(prepared, probe, preferred_type)
                 .await;
@@ -290,33 +312,32 @@ impl DnsService {
         let fallback = Box::pin(self.exchange_query(fallback));
         let probe = Box::pin(self.exchange_query(probe));
 
-        match select(fallback, probe).await {
-            futures_util::future::Either::Left((fallback_result, probe)) => {
-                match select(probe, timer).await {
-                    futures_util::future::Either::Left((probe_result, _)) => {
-                        if let Ok(response) = probe_result
-                            && response_has_address_answer(&response, preferred_type)?
-                        {
-                            return Ok(make_nodata_response(&fallback_query, question_end)?);
-                        }
-                    }
-                    futures_util::future::Either::Right(((), _)) => {}
-                }
-                fallback_result
+        let (fallback, probe_response) = match select(fallback, probe).await {
+            Left((fallback_result, probe)) => (
+                Left(fallback_result),
+                match select(probe, timer.as_mut()).await {
+                    Left((result, _)) => result.ok(),
+                    Right(_) => None,
+                },
+            ),
+            Right((probe_result, fallback)) => (Right(fallback), probe_result.ok()),
+        };
+        if let Some(response) = probe_response {
+            let parsed = parse_message(&response)?;
+            if parsed.rcode == OptRcode::NOERROR
+                && parsed.records.iter().any(|record| {
+                    record.section == Section::Answer && record.rtype == preferred_type
+                })
+            {
+                return Ok(make_nodata_response(&fallback_query, question_end)?);
             }
-            futures_util::future::Either::Right((probe_result, fallback)) => {
-                if let Ok(response) = probe_result
-                    && response_has_address_answer(&response, preferred_type)?
-                {
-                    return Ok(make_nodata_response(&fallback_query, question_end)?);
-                }
-                match select(fallback, timer).await {
-                    futures_util::future::Either::Left((fallback_result, _)) => fallback_result,
-                    futures_util::future::Either::Right(((), _)) => {
-                        Err(DnsError::Timeout(timeout_ms))
-                    }
-                }
-            }
+        }
+        match fallback {
+            Left(fallback_result) => fallback_result,
+            Right(fallback) => match select(fallback, timer).await {
+                Left((fallback_result, _)) => fallback_result,
+                Right(((), _)) => Err(DnsError::Timeout(timeout_ms)),
+            },
         }
     }
 
@@ -325,58 +346,13 @@ impl DnsService {
             .cache
             .as_ref()
             .filter(|_| prepared.cacheable)
-            .map(|cache| {
-                let query = prepared
-                    .bytes
-                    .get(2..)
-                    .ok_or_else(|| Error::RustError("DNS query header out of range".into()))?;
-                Ok::<_, Error>(format!(
-                    "{}{}",
-                    cache.prefix,
-                    URL_SAFE_NO_PAD.encode(Sha256::digest(query))
-                ))
-            })
+            .map(|cache| cache.key(&prepared.bytes).map(|key| (cache, key)))
             .transpose()?;
         let mut response = None;
-        if let (Some(_), Some(key)) = (&self.cache, &cache_key) {
-            match async {
-                let cache = Cache::open("cfwp-dns".into()).await;
-                let Some(mut cached) = cache.get(key, false).await? else {
-                    return Ok::<Option<Vec<u8>>, Error>(None);
-                };
-                let stored = cached
-                    .headers()
-                    .get("x-cfwp-stored-at")?
-                    .and_then(|value| value.parse::<f64>().ok());
-                let ttl = cached
-                    .headers()
-                    .get("x-cfwp-ttl")?
-                    .and_then(|value| value.parse::<u32>().ok());
-                let (Some(stored), Some(ttl)) = (stored, ttl) else {
-                    return Ok(None);
-                };
-                #[allow(clippy::cast_sign_loss)]
-                let elapsed = ((js_sys::Date::now() - stored) / 1000.0).max(0.0) as u32;
-                if elapsed >= ttl {
-                    return Ok(None);
-                }
-                let mut bytes = read_body(cached.stream()?, self.config.max_message_bytes).await?;
-                if bytes.len() < 12 {
-                    return Ok(None);
-                }
-                let response_id = bytes
-                    .get_mut(..2)
-                    .ok_or_else(|| Error::RustError("DNS response ID out of range".into()))?;
-                let query_id = prepared
-                    .bytes
-                    .get(..2)
-                    .ok_or_else(|| Error::RustError("DNS query ID out of range".into()))?;
-                response_id.copy_from_slice(query_id);
-                validate_response(&prepared.bytes, &bytes)?;
-                age(&mut bytes, elapsed)?;
-                Ok(Some(bytes))
-            }
-            .await
+        if let Some((cache, key)) = &cache_key {
+            match cache
+                .load(key, &prepared.bytes, self.config.max_message_bytes)
+                .await
             {
                 Ok(cached) => response = cached,
                 Err(err) => tracing::info!("DNS cache read failed: {err}"),
@@ -399,65 +375,8 @@ impl DnsService {
                     .await?;
                 let response = result.bytes;
                 if !result.retried_without_ecs
-                    && let (Some(cache), Some(key)) = (&self.cache, cache_key)
-                    && let Err(err) = async {
-                        if response.len() > cache.config.max_message_bytes {
-                            return Ok(());
-                        }
-                        let parsed = parse_message(&response)?;
-                        let ttl = if !parsed.qr
-                            || parsed.truncated
-                            || parsed.signed
-                            || parsed.has_cookie
-                            || (parsed.rcode != OptRcode::NOERROR
-                                && parsed.rcode != OptRcode::NXDOMAIN)
-                        {
-                            None
-                        } else if parsed.answer_count > 0 && parsed.rcode == OptRcode::NOERROR {
-                            parsed
-                                .records
-                                .iter()
-                                .filter(|record| record.rtype != Rtype::OPT)
-                                .map(|record| record.ttl)
-                                .min()
-                        } else {
-                            let negative_ttl = parsed
-                                .records
-                                .iter()
-                                .filter(|record| record.section == Section::Authority)
-                                .filter_map(|record| {
-                                    record.soa_minimum.map(|minimum| record.ttl.min(minimum))
-                                })
-                                .min();
-                            let record_ttl = parsed
-                                .records
-                                .iter()
-                                .filter(|record| record.rtype != Rtype::OPT)
-                                .map(|record| record.ttl)
-                                .min();
-                            negative_ttl.map(|ttl| ttl.min(record_ttl.unwrap_or(ttl)))
-                        };
-                        let Some(ttl) = ttl else {
-                            return Ok(());
-                        };
-                        let ttl = ttl.min(cache.config.max_ttl);
-                        if ttl == 0 {
-                            return Ok(());
-                        }
-                        let headers = Headers::new();
-                        headers.set("content-type", "application/dns-message")?;
-                        headers.set("cache-control", &format!("public, max-age={ttl}"))?;
-                        headers.set("x-cfwp-stored-at", &js_sys::Date::now().to_string())?;
-                        headers.set("x-cfwp-ttl", &ttl.to_string())?;
-                        Cache::open("cfwp-dns".into())
-                            .await
-                            .put(
-                                key,
-                                Response::from_bytes(response.to_vec())?.with_headers(headers),
-                            )
-                            .await
-                    }
-                    .await
+                    && let Some((cache, key)) = cache_key
+                    && let Err(err) = cache.store(&key, &response).await
                 {
                     tracing::info!("DNS cache write failed: {err}");
                 }
@@ -473,35 +392,38 @@ impl DnsService {
         {
             let parsed = parse_message(&response)?;
             if !parsed.signed
+                && !parsed.ecs_ranges.is_empty()
                 && let Some(opt) = parsed.opt
             {
-                let ranges = parsed.ecs_ranges;
-                if !ranges.is_empty() {
-                    if opt.end == response.len() {
-                        let removed = ranges.iter().map(|(start, end)| end - start).sum::<usize>();
-                        for (start, end) in ranges.into_iter().rev() {
-                            response.drain(start..end);
-                        }
-                        write_u16(
-                            &mut response,
-                            opt.rdlen_offset,
-                            opt.rdlen.checked_sub(removed).ok_or_else(|| {
-                                Error::RustError("invalid ECS option length".into())
-                            })? as u16,
-                        )?;
-                    } else {
-                        for (start, end) in ranges {
-                            write_u16(&mut response, start, EDNS_OPTION_PADDING)?;
-                            response
-                                .get_mut(start + 4..end)
-                                .ok_or_else(|| {
-                                    Error::RustError("EDNS padding range out of bounds".into())
-                                })?
-                                .fill(0);
-                        }
+                if opt.end == response.len() {
+                    let removed = parsed
+                        .ecs_ranges
+                        .iter()
+                        .map(|(start, end)| end - start)
+                        .sum::<usize>();
+                    for (start, end) in parsed.ecs_ranges.into_iter().rev() {
+                        response.drain(start..end);
                     }
-                    parse_message(&response)?;
+                    write_u16(
+                        &mut response,
+                        opt.rdlen_offset,
+                        opt.rdlen
+                            .checked_sub(removed)
+                            .ok_or_else(|| Error::RustError("invalid ECS option length".into()))?
+                            as u16,
+                    )?;
+                } else {
+                    for (start, end) in parsed.ecs_ranges {
+                        write_u16(&mut response, start, 12_u16)?;
+                        response
+                            .get_mut(start + 4..end)
+                            .ok_or_else(|| {
+                                Error::RustError("EDNS padding range out of bounds".into())
+                            })?
+                            .fill(0);
+                    }
                 }
+                parse_message(&response)?;
             }
         }
         Ok(response)
@@ -631,7 +553,7 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
                         option.map_err(|_| Error::RustError("malformed EDNS option".into()))?;
                     let option_end = option_pos + 4 + option.as_slice().len();
                     match u16::from(option.code()) {
-                        EDNS_OPTION_ECS => {
+                        8 => {
                             has_ecs = true;
                             ecs_ranges.push((option_pos, option_end));
                         }
@@ -646,12 +568,10 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
                     end,
                 });
             } else if rtype == Rtype::SOA {
-                match rdata {
-                    AllRecordData::Soa(soa) => {
-                        soa_minimum = Some(soa.minimum().as_secs());
-                    }
-                    _ => return Err(Error::RustError("malformed SOA resource data".into())),
-                }
+                let AllRecordData::Soa(soa) = rdata else {
+                    return Err(Error::RustError("malformed SOA resource data".into()));
+                };
+                soa_minimum = Some(soa.minimum().as_secs());
             }
 
             records.push(RecordInfo {
@@ -692,15 +612,6 @@ pub(super) fn parse_message(payload: &[u8]) -> Result<ParsedMessage> {
         opt,
         records,
     })
-}
-
-fn response_has_address_answer(response: &[u8], address_type: Rtype) -> Result<bool> {
-    let parsed = parse_message(response)?;
-    Ok(parsed.rcode == OptRcode::NOERROR
-        && parsed
-            .records
-            .iter()
-            .any(|record| record.section == Section::Answer && record.rtype == address_type))
 }
 
 fn make_nodata_response(query: &[u8], question_end: usize) -> Result<Vec<u8>> {

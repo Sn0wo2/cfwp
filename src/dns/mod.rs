@@ -1,7 +1,9 @@
 mod cache;
 pub(crate) mod config;
+pub(crate) mod inbound;
 mod lookup;
-pub(crate) mod upstream;
+mod outbound;
+mod transport;
 pub(crate) mod util;
 pub(crate) mod wire;
 
@@ -9,7 +11,7 @@ use cache::DnsCache;
 use config::DnsConfig;
 use std::fmt;
 use std::rc::Rc;
-use upstream::UpstreamPool;
+use transport::UpstreamPool;
 use worker::Error;
 
 #[derive(Debug)]
@@ -40,11 +42,8 @@ impl From<Error> for DnsError {
 impl From<DnsError> for Error {
     fn from(err: DnsError) -> Self {
         match err {
-            DnsError::TooLarge => Self::RustError("DNS message too large".into()),
-            DnsError::Timeout(timeout_ms) => {
-                Self::RustError(format!("DNS request timed out after {timeout_ms} ms"))
-            }
             DnsError::Other(err) => err,
+            err => Self::RustError(err.to_string()),
         }
     }
 }
@@ -54,6 +53,7 @@ pub(crate) type DnsResult<T> = Result<T, DnsError>;
 #[derive(Clone)]
 pub(crate) struct DnsService {
     pub(crate) config: Rc<DnsConfig>,
+    pub(crate) inbound: inbound::Config,
     upstreams: UpstreamPool,
     cache: Option<Rc<DnsCache>>,
 }

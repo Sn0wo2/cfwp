@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use worker::{Error, Result, Url};
+use worker::{Error, Result};
 
 const MAX_TIMEOUT_MS: u32 = 60_000;
 const MAX_MESSAGE_BYTES: usize = 65_535;
@@ -56,73 +56,14 @@ pub(crate) struct DnsServerConfig {
     pub path: Option<String>,
 }
 
-impl DnsServerConfig {
-    pub(crate) fn url(&self) -> Result<String> {
-        let server = self.server.trim();
-        if server.is_empty() || server != self.server || server.contains(['/', '?', '#', '@']) {
-            return Err(Error::RustError(
-                "invalid DNS config: DNS server name must not be empty".into(),
-            ));
-        }
-        let raw_host = server
-            .strip_prefix('[')
-            .and_then(|value| value.strip_suffix(']'))
-            .unwrap_or(server);
-        let host = if raw_host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{raw_host}]")
-        } else {
-            raw_host.to_string()
-        };
-        let (scheme, default_port) = match self.kind {
-            DnsServerType::Https => ("https", 443),
-            DnsServerType::Tls => ("tls", 853),
-            DnsServerType::Tcp => ("tcp", 53),
-        };
-        let port = self.server_port.unwrap_or(default_port);
-        if port == 0 {
-            return Err(Error::RustError(
-                "invalid DNS config: DNS server_port must not be zero".into(),
-            ));
-        }
-        let path = if self.kind == DnsServerType::Https {
-            let path = self.path.as_deref().unwrap_or("/dns-query");
-            if !path.starts_with('/') || path.contains(['?', '#']) {
-                return Err(Error::RustError(
-                    "invalid DNS config: DNS HTTPS path must be an absolute path".into(),
-                ));
-            }
-            path
-        } else {
-            if self.path.is_some() {
-                return Err(Error::RustError(
-                    "invalid DNS config: DNS path is only supported for HTTPS servers".into(),
-                ));
-            }
-            ""
-        };
-        let url = Url::parse(&format!("{scheme}://{host}:{port}{path}")).map_err(|_| {
-            Error::RustError("invalid DNS config: invalid DNS server address".into())
-        })?;
-        if url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-            || url.query().is_some()
-        {
-            return Err(Error::RustError(
-                "invalid DNS config: invalid DNS server address".into(),
-            ));
-        }
-        Ok(url.to_string())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DnsServerType {
     Https,
     Tls,
     Tcp,
+    Ws,
+    Wss,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]

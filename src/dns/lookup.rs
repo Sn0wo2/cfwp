@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
-use domain::base::{Message, MessageBuilder, Name, Rtype};
+use domain::base::iana::Rcode;
+use domain::base::{Message, MessageBuilder, Name, ParsedName, Rtype};
 use domain::rdata::AllRecordData;
 use worker::Error;
 
@@ -26,7 +27,7 @@ impl DnsService {
         let Ok(message) = Message::from_octets(response) else {
             return Ok(None);
         };
-        if message.header().rcode() != domain::base::iana::Rcode::NOERROR {
+        if message.header().rcode() != Rcode::NOERROR {
             return Ok(None);
         }
         Ok(Some(message))
@@ -45,8 +46,7 @@ impl DnsService {
             if parsed.rtype() != Rtype::TXT {
                 continue;
             }
-            let Ok(Some(record)) =
-                parsed.into_record::<AllRecordData<&[u8], domain::base::name::ParsedName<&[u8]>>>()
+            let Ok(Some(record)) = parsed.into_record::<AllRecordData<&[u8], ParsedName<&[u8]>>>()
             else {
                 continue;
             };
@@ -54,11 +54,7 @@ impl DnsService {
                 continue;
             };
             let mut value = String::new();
-            for part in txt.iter() {
-                if let Ok(part) = std::str::from_utf8(part) {
-                    value.push_str(part);
-                }
-            }
+            value.extend(txt.iter().filter_map(|part| std::str::from_utf8(part).ok()));
             if !value.is_empty() {
                 records.push(value);
                 if records.len() == 16 {
@@ -98,19 +94,17 @@ impl DnsService {
                 if parsed.rtype() != qtype {
                     continue;
                 }
-                let Ok(Some(record)) = parsed
-                    .into_record::<AllRecordData<&[u8], domain::base::name::ParsedName<&[u8]>>>()
+                let Ok(Some(record)) =
+                    parsed.into_record::<AllRecordData<&[u8], ParsedName<&[u8]>>>()
                 else {
                     continue;
                 };
                 let address = match record.data() {
-                    AllRecordData::A(address) => Some(IpAddr::V4(address.addr())),
-                    AllRecordData::Aaaa(address) => Some(IpAddr::V6(address.addr())),
-                    _ => None,
+                    AllRecordData::A(address) => IpAddr::V4(address.addr()),
+                    AllRecordData::Aaaa(address) => IpAddr::V6(address.addr()),
+                    _ => continue,
                 };
-                if let Some(address) = address
-                    && !addresses.contains(&address)
-                {
+                if !addresses.contains(&address) {
                     addresses.push(address);
                 }
             }
