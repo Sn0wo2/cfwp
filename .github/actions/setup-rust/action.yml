@@ -5,9 +5,7 @@ runs:
   steps:
     - name: Install Rust toolchain
       shell: bash
-      run: |
-        rustup show
-        echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+      run: rustup show
     - name: Cache Cargo
       uses: Swatinem/rust-cache@v2
       with:
