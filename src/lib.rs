@@ -1,21 +1,17 @@
 mod config;
 mod dns;
-
-use crate::dns::DnsError;
-use crate::dns::util::read_body;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 mod proxy;
 mod util;
+
+use std::sync::OnceLock;
 
 use worker::*;
 
 #[allow(clippy::single_call_fn)]
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    static ACTA_GUARD: std::sync::OnceLock<std::result::Result<acta::TracingGuard, String>> =
-        std::sync::OnceLock::new();
-    let logging = ACTA_GUARD.get_or_init(|| {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    static ACTA_GUARD: OnceLock<std::result::Result<acta::TracingGuard, String>> = OnceLock::new();
+    if let Err(err) = ACTA_GUARD.get_or_init(|| {
         acta::init(
             acta::Config::builder()
                 .with_writers([acta::Writer::stdout()
@@ -29,17 +25,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .build(),
         )
         .map_err(|err| format!("Logging initialization failed: {err}"))
-    });
-    if let Err(err) = logging {
+    }) {
         return Err(Error::RustError(err.clone()));
     }
 
     let url = req.url()?;
     tracing::info!("fetch: {} {}", req.method(), url.path());
     let config =
-        config::Config::from_env(&env, &url.origin().ascii_serialization()).map_err(|err| {
+        config::Config::from_env(&env, &url.origin().ascii_serialization()).inspect_err(|err| {
             tracing::error!("Configuration failed: {err}");
-            err
         })?;
     if req
         .headers()
@@ -47,107 +41,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .ok()
         .flatten()
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+        && url.path() != dns::inbound::ws::PATH
     {
         tracing::info!("fetch: websocket upgrade requested");
-        return proxy::handle(&config, req, _ctx).await;
+        return proxy::handle(&config, req, ctx).await;
     }
 
-    if url.path() == "/dns-query" {
-        let limit = config.dns.config.max_message_bytes;
-        let payload = match req.method() {
-            Method::Get => {
-                let mut params = url.query_pairs().filter(|(name, _)| name == "dns");
-                let Some((_, dns)) = params.next() else {
-                    return error("Missing dns parameter", 400);
-                };
-                if params.next().is_some() {
-                    return error("Duplicate dns parameter", 400);
-                }
-                if dns.len() > limit.div_ceil(3) * 4 {
-                    return error("DNS query too large", 413);
-                }
-                match URL_SAFE_NO_PAD.decode(dns.as_bytes()) {
-                    Ok(bytes) if bytes.len() <= limit => bytes,
-                    Ok(_) => return error("DNS query too large", 413),
-                    Err(_) => return error("Invalid base64url DNS query", 400),
-                }
-            }
-            Method::Post => {
-                if !req
-                    .headers()
-                    .get("content-type")?
-                    .unwrap_or_default()
-                    .split(';')
-                    .next()
-                    .is_some_and(|value| {
-                        value.trim().eq_ignore_ascii_case("application/dns-message")
-                    })
-                {
-                    return error("Expected application/dns-message", 415);
-                }
-                if let Some(length) = req.headers().get("content-length")? {
-                    match length.parse::<usize>() {
-                        Ok(length) if length <= limit => {}
-                        Ok(_) => return error("DNS query too large", 413),
-                        Err(_) => return error("Invalid Content-Length", 400),
-                    }
-                }
-                match read_body(req.stream()?, limit).await {
-                    Ok(bytes) => bytes,
-                    Err(DnsError::TooLarge) => return error("Invalid or oversized DNS body", 413),
-                    Err(_) => return error("Invalid or oversized DNS body", 400),
-                }
-            }
-            _ => {
-                let mut response = error("Method Not Allowed", 405)?;
-                response.headers_mut().set("allow", "GET, POST")?;
-                return Ok(response);
-            }
-        };
-        let prepared = match config.dns.prepare(
-            &payload,
-            req.headers()
-                .get("CF-Connecting-IP")?
-                .and_then(|value| value.parse().ok()),
-        ) {
-            Ok(prepared) => prepared,
-            Err(DnsError::TooLarge) => return error("Invalid or oversized DNS query", 413),
-            Err(_) => return error("Invalid or oversized DNS query", 400),
-        };
-        return match config.dns.exchange_prepared(prepared).await {
-            Ok(bytes) => {
-                let headers = Headers::new();
-                headers.set("content-type", "application/dns-message")?;
-                headers.set("cache-control", "no-store")?;
-                headers.set("x-content-type-options", "nosniff")?;
-                Ok(Response::from_bytes(bytes)?.with_headers(headers))
-            }
-            Err(err) => {
-                tracing::error!("DNS exchange failed: {err}");
-                error(
-                    "DNS upstream unavailable",
-                    if matches!(err, DnsError::Timeout(_)) {
-                        504
-                    } else {
-                        502
-                    },
-                )
-            }
-        };
+    if url.path() == dns::inbound::https::PATH {
+        return dns::inbound::https::handle(&config.dns, &config.dns.inbound.https, req).await;
+    }
+    if url.path() == dns::inbound::ws::PATH {
+        return dns::inbound::ws::handle(&config.dns, &config.dns.inbound.ws, req, ctx);
     }
 
     tracing::info!("fetch: request without websocket upgrade");
-    Response::from_json(&std::collections::BTreeMap::from([(
-        "msg",
-        "cfwp working!",
-    )]))
-}
-
-fn error(message: &str, status: u16) -> Result<Response> {
-    let mut response = Response::error(message, status)?;
-    response.headers_mut().set("cache-control", "no-store")?;
-    response
-        .headers_mut()
-        .set("x-content-type-options", "nosniff")?;
-    Ok(response)
+    Response::from_json(&serde_json::json!({ "msg": "cfwp working!" }))
 }
