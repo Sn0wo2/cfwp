@@ -6,7 +6,7 @@ use worker::{Error, Result, Url};
 use super::TransportConfig;
 
 pub(super) fn validate_tag(tag: &str, tags: &mut HashSet<String>) -> Result<()> {
-    if tag.trim().is_empty() || tag.trim() != tag || !tags.insert(tag.to_string()) {
+    if tag.is_empty() || tag.trim() != tag || !tags.insert(tag.to_string()) {
         return Err(Error::RustError(
             "invalid CONFIG: tags must be nonempty and unique".into(),
         ));
@@ -15,14 +15,11 @@ pub(super) fn validate_tag(tag: &str, tags: &mut HashSet<String>) -> Result<()> 
 }
 
 pub(super) fn validate_uuid(value: &str) -> Result<String> {
-    let uuid = Uuid::parse_str(value)
-        .map_err(|_| Error::RustError("invalid CONFIG: user UUID must be a UUIDv4".into()))?;
-    if uuid.get_version() != Some(Version::Random) {
-        return Err(Error::RustError(
-            "invalid CONFIG: user UUID must be a UUIDv4".into(),
-        ));
-    }
-    Ok(uuid.to_string())
+    Ok(Uuid::parse_str(value)
+        .ok()
+        .filter(|uuid| uuid.get_version() == Some(Version::Random))
+        .ok_or_else(|| Error::RustError("invalid CONFIG: user UUID must be a UUIDv4".into()))?
+        .to_string())
 }
 
 pub(super) fn validate_unique_credential(
@@ -49,8 +46,18 @@ pub(super) fn validate_transport(transport: Option<&TransportConfig>) -> Result<
     Ok(())
 }
 
+fn bare_host(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    (url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then_some(host)
+}
+
 pub(super) fn validate_server(server: &str, port: u16) -> Result<()> {
-    if server.trim().is_empty()
+    if server.is_empty()
         || server.trim() != server
         || server.contains(['/', '?', '#', '@'])
         || port == 0
@@ -61,7 +68,7 @@ pub(super) fn validate_server(server: &str, port: u16) -> Result<()> {
     }
     let raw_host = server
         .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(server);
     let host = if raw_host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{raw_host}]")
@@ -70,13 +77,7 @@ pub(super) fn validate_server(server: &str, port: u16) -> Result<()> {
     };
     let url = Url::parse(&format!("tcp://{host}:{port}"))
         .map_err(|_| Error::RustError("invalid CONFIG: outbound server is invalid".into()))?;
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || !matches!(url.path(), "" | "/")
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    if bare_host(&url).is_none() {
         return Err(Error::RustError(
             "invalid CONFIG: outbound server is invalid".into(),
         ));
@@ -106,27 +107,16 @@ pub(crate) fn parse_tproxy_servers(server: &str, default_port: u16) -> Result<Ve
             let url = Url::parse(&format!("tcp://{candidate}")).map_err(|_| {
                 Error::RustError("invalid CONFIG: tproxy server address is invalid".into())
             })?;
-            let host = url
-                .host_str()
-                .and_then(|host| {
-                    host.strip_prefix('[')
-                        .and_then(|value| value.strip_suffix(']'))
-                        .or(Some(host))
-                })
-                .ok_or_else(|| {
-                    Error::RustError("invalid CONFIG: tproxy server address is invalid".into())
-                })?;
-            if !url.username().is_empty()
-                || url.password().is_some()
-                || !matches!(url.path(), "" | "/")
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(Error::RustError(
-                    "invalid CONFIG: tproxy server address is invalid".into(),
-                ));
-            }
-            (host.to_string(), url.port().unwrap_or(default_port))
+            let host = bare_host(&url).ok_or_else(|| {
+                Error::RustError("invalid CONFIG: tproxy server address is invalid".into())
+            })?;
+            (
+                host.strip_prefix('[')
+                    .and_then(|host| host.strip_suffix(']'))
+                    .unwrap_or(host)
+                    .to_string(),
+                url.port().unwrap_or(default_port),
+            )
         };
 
         if port == 0 {

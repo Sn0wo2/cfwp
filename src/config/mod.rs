@@ -198,11 +198,10 @@ impl Settings {
             }
         }
 
-        if self.route.final_outbound.is_empty()
-            || !self
-                .outbounds
-                .iter()
-                .any(|outbound| outbound.tag() == self.route.final_outbound)
+        if !self
+            .outbounds
+            .iter()
+            .any(|outbound| outbound.tag() == self.route.final_outbound)
         {
             return Err(Error::RustError(
                 "invalid CONFIG: route.final must reference an outbound tag".into(),
@@ -327,15 +326,14 @@ pub(crate) enum TransportConfig {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WsTransport {
+    #[serde(default = "default_ws_path")]
     pub(crate) path: String,
 }
 
-impl Default for WsTransport {
-    fn default() -> Self {
-        Self { path: "/".into() }
-    }
+fn default_ws_path() -> String {
+    "/".into()
 }
 
 #[derive(Deserialize)]
