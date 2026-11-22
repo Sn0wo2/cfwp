@@ -6,7 +6,7 @@ runs:
     - uses: ./.github/actions/setup-rust
     - uses: actions/setup-node@v4
       with:
-        node-version: 24
+        node-version: 26
     - name: Install worker-build
       shell: bash
       run: cargo install worker-build --version 0.9.0 --locked
