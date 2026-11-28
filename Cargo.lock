@@ -235,7 +235,7 @@ dependencies = [
  "chacha20poly1305",
  "crc32fast",
  "dns-over-websocket",
- "domain",
+ "domain 0.13.1",
  "futures-util",
  "getrandom",
  "hashlink",
@@ -427,7 +427,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528f31558bbf293b1cc531a0f785525e8b985532846a7916dab195d00ca0a240"
 dependencies = [
  "base64",
- "domain",
+ "domain 0.12.3",
  "form_urlencoded",
  "serde",
  "serde_json",
@@ -443,10 +443,34 @@ checksum = "5b68712c02bff2348323c1441ab2e8528e32af4f8f9edf29356356290328c8e6"
 dependencies = [
  "bumpalo",
  "bytes",
- "domain-macros",
+ "domain-macros 0.12.3",
  "hashbrown",
- "jiff",
+ "jiff 0.2.44",
  "octseq",
+ "serde",
+]
+
+[[package]]
+name = "domain"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86baea5a64d74dca9f2a58eb8a49ac9a6ddc8031cffe310eaefda4941419724d"
+dependencies = [
+ "bytes",
+ "domain-new",
+ "hashbrown",
+ "jiff 1.0.3",
+ "octseq",
+ "serde",
+]
+
+[[package]]
+name = "domain-base"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1019f917b1856142688bcc894d76b3cf74516e6758ce0f826595b9c113625845"
+dependencies = [
+ "domain-macros 0.13.0",
  "serde",
 ]
 
@@ -459,6 +483,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "domain-macros"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa78f7a3286cf87edf6354c4dd5960cf03298b972c3c8d1e25b8ed19ba4e49a4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "domain-new"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d48f379b48195c92c6f625086d338ea21f630c4a37b3a96771a2865a94eededb"
+dependencies = [
+ "domain-base",
 ]
 
 [[package]]
@@ -893,8 +937,22 @@ version = "0.2.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac63a5a611e9d720726d6ab6ee2ee19e6f620503554ea5d303c7cb294ff40c12"
 dependencies = [
- "jiff-core",
- "jiff-static",
+ "jiff-core 0.1.6",
+ "jiff-static 0.2.44",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "107f2e89536b6818514025f6787b0d94d819e54fe3b40365275fc753de485b3f"
+dependencies = [
+ "jiff-core 1.0.2",
+ "jiff-static 1.0.3",
  "log",
  "portable-atomic",
  "portable-atomic-util",
@@ -911,15 +969,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d44c923edf2bf456a982253f1a9ee1f6e89e421dffd0065d9b9a581da0def58f"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f9c27796c21cc8b33ce490f148d53fe41d679b887885bf0ef8f662cdb9b35c0"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.6",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4996f71e569e3a3e32b925c28ef8f0027dc30bb1d594b33eeda409eea185f5c8"
+dependencies = [
+ "jiff-core 1.0.2",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]

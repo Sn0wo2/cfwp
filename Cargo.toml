@@ -26,7 +26,7 @@ aes = "0.9"
 base64 = "0.23"
 chacha20poly1305 = "0.11"
 crc32fast = "1"
-domain = { version = "0.12", default-features = false, features = ["std"] }
+domain = { version = "0.13", default-features = false, features = ["std"] }
 futures-util = "0.3"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 hashlink = "0.12"
